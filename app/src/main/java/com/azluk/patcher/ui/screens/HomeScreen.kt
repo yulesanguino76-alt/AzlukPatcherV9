@@ -383,4 +383,3 @@ fun rememberDrawablePainter(drawable: Drawable): androidx.compose.ui.graphics.pa
             }
         }
     }
-}
