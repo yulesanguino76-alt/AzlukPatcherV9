@@ -131,6 +131,14 @@ data class ScanResult(
     val offset:    Int
 )
 
+data class PatchPack(
+    val id:          String,
+    val name:        String,
+    val icon:        String,
+    val category:    String,
+    val description: String
+)
+
 sealed class PatchState {
     object Idle : PatchState()
     data class Running(val log: List<String>) : PatchState()
