@@ -1,471 +1,1709 @@
 package com.azluk.patcher.engine;
 
-import android.content.Context;
-import android.util.Log;
-import java.io.*;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.zip.Adler32;
 
 /**
- * AzlukPatcher V9 — SuperDexPatcher
+ * AzlukPatcher V9 - SuperDexPatcher
  *
- * The most complete DEX surgery engine assembled from all 8 patchers:
+ * DEX parser/transformer deliberately conservative:
  *
- * Absorbed techniques:
- *  ApkEditorPro — MATCH_REPLACE pattern engine: scan string pool → regex-like
- *                  match on smali patterns → collapse or redirect methods
- *  LuckyPatcher — license bypass via iget-object signatures field interception,
- *                  IAP billing response code injection, 79-pattern ads blocklist
- *  NPManager    — SSL unpin: X509TrustManager, OkHttp CertificatePinner,
- *                  Conscrypt, HttpsURLConnection hostname verifier
- *  GameGuardian — Root/emulator bypass: Build field checks, su path checks,
- *                  prop file reads, /proc/self/status TracerPid
- *  JasiPatcher  — FLAG_SECURE nop, ptrace anti-debug collapse
- *  MTManager    — smali-level string replacement for package name changes
- *  hack-app-data — exported component patches, backup flag patches
- *  cheat-engine — memory pattern scanning for runtime value patches
+ *  - validates the DEX header before reading tables
+ *  - uses the real DEX offsets from the specification
+ *  - decodes DEX strings as MUTF-8
+ *  - resolves methods structurally through:
  *
- * Architecture:
- *   Phase 1: String pool scan → collect matched string indices (OOM-safe)
- *   Phase 2: Class def walk → method body surgery on matched methods
- *   Phase 3: Manifest binary XML patch
- *   Phase 4: Adler32 + SHA-1 recomputation
+ *      class_defs
+ *          -> class_data
+ *          -> method_idx
+ *          -> method_ids
+ *          -> name_idx
+ *          -> string_ids
  *
- * All branded as AzlukPatcher V9.
+ *      method_ids
+ *          -> proto_idx
+ *          -> return_type_idx
+ *          -> type_ids
+ *          -> string_ids
+ *
+ *  - never uses generic const-string matches as a method selector
+ *  - refuses to modify methods with exception handlers
+ *  - refuses malformed structures instead of returning the original file
+ *  - recomputes SHA-1 and Adler32 only after successful mutation
+ *
+ * The transformer currently exposes benign developer/telemetry recipes.
+ * Security-control bypass recipes are intentionally not implemented here.
  */
-public class SuperDexPatcher {
+public final class SuperDexPatcher {
 
-    private static final String TAG = "AzlukV9";
-    private static final int MAX_DEX = 60 * 1024 * 1024;  // 60MB cap
-
-    // Dalvik opcodes
-    static final byte RET_VOID  = 0x0e;
-    static final byte CONST4    = 0x12;
-    static final byte RETURN    = 0x0f;
-    static final byte RETURN_OBJ= 0x11;
-    static final byte CONST16   = 0x13;  // const/16 — for int returns
-    static final byte NOP       = 0x00;
-
-    // Binary manifest attribute IDs
-    public static final int ATTR_DEBUGGABLE  = 0x0101021b;
-    public static final int ATTR_EXPORTED    = 0x010102d4;
-    public static final int ATTR_ALLOW_BACK  = 0x010100d1;
-    public static final int ATTR_FULL_BACK   = 0x010104eb;
-    public static final int ATTR_FLAG_SECURE = 0x0101021e;
-
-    // ── Master pattern table — all patchers merged ────────────────────────────
-    // {string_marker, patch_type_key, description, patch_strategy}
-    // Strategies: RET_VOID, RETURN_FALSE, RETURN_TRUE, RETURN_ZERO, NOP4
-    private static final String[][] PATTERNS = {
-        // ── LICENSE (LuckyPatcher LVL technique) ──────────────────────────────
-        {"ILicensingService",                          "LICENSE_BYPASS",    "LVL service",         "RET_VOID"},
-        {"android/content/pm/ILicensingService",       "LICENSE_BYPASS",    "LVL IPC",             "RET_VOID"},
-        {"com/google/android/vending/licensing",       "LICENSE_BYPASS",    "LVL package",         "RET_VOID"},
-        {"LICENSED",                                   "LICENSE_BYPASS",    "LVL constant",        "RET_VOID"},
-        {"Policy",                                     "LICENSE_BYPASS",    "LVL Policy",          "RET_VOID"},
-        {"allowAccess",                                "LICENSE_BYPASS",    "LVL allowAccess",     "RETURN_TRUE"},
-        // ── IAP BYPASS ────────────────────────────────────────────────────────
-        {"com/android/vending/billing",                "IAP_BYPASS",        "Play billing",        "RET_VOID"},
-        {"com/android/vending/BILLING",                "IAP_BYPASS",        "billing intent",      "RET_VOID"},
-        {"PURCHASED",                                  "IAP_BYPASS",        "purchase state",      "RET_VOID"},
-        {"BillingClient",                              "IAP_BYPASS",        "BillingClient",       "RET_VOID"},
-        {"querySkuDetails",                            "IAP_BYPASS",        "SKU details",         "RET_VOID"},
-        {"launchBillingFlow",                          "IAP_BYPASS",        "billing flow",        "RET_VOID"},
-        {"acknowledgePurchase",                        "IAP_BYPASS",        "ack purchase",        "RET_VOID"},
-        // ── SIGNATURE BYPASS (ApkEditorPro Fix.smali technique) ───────────────
-        {"getSignatures",                              "SIGNATURE_BYPASS",  "getSignatures",       "RET_VOID"},
-        {"GET_SIGNATURES",                             "SIGNATURE_BYPASS",  "GET_SIGNATURES",      "RET_VOID"},
-        {"signingInfo",                                "SIGNATURE_BYPASS",  "SigningInfo API28",   "RET_VOID"},
-        {"getSigningInfo",                             "SIGNATURE_BYPASS",  "getSigningInfo",      "RET_VOID"},
-        {"PackageInfo",                                "SIGNATURE_BYPASS",  "PackageInfo sig",     "RET_VOID"},
-        // ── GOOGLE PLAY BYPASS ────────────────────────────────────────────────
-        {"com/google/android/gms/common",              "GOOGLE_PLAY_BYPASS","GMS common",          "RET_VOID"},
-        {"GoogleApiAvailability",                      "GOOGLE_PLAY_BYPASS","GMS avail check",     "RETURN_TRUE"},
-        {"isGooglePlayServicesAvailable",              "GOOGLE_PLAY_BYPASS","GPS avail",           "RETURN_ZERO"},
-        // ── ADS — 20+ SDKs (LuckyPatcher + our expansion) ────────────────────
-        {"com/google/android/gms/ads",                 "REMOVE_ADS",        "AdMob",               "RET_VOID"},
-        {"com/facebook/ads",                           "REMOVE_ADS",        "Facebook Ads",        "RET_VOID"},
-        {"com/unity3d/ads",                            "REMOVE_ADS",        "Unity Ads",           "RET_VOID"},
-        {"com/applovin",                               "REMOVE_ADS",        "AppLovin",            "RET_VOID"},
-        {"com/ironsource",                             "REMOVE_ADS",        "IronSource",          "RET_VOID"},
-        {"com/mopub",                                  "REMOVE_ADS",        "MoPub",               "RET_VOID"},
-        {"com/chartboost",                             "REMOVE_ADS",        "Chartboost",          "RET_VOID"},
-        {"com/vungle",                                 "REMOVE_ADS",        "Vungle",              "RET_VOID"},
-        {"com/inmobi",                                 "REMOVE_ADS",        "InMobi",              "RET_VOID"},
-        {"com/mintegral",                              "REMOVE_ADS",        "Mintegral",           "RET_VOID"},
-        {"com/startapp",                               "REMOVE_ADS",        "StartApp",            "RET_VOID"},
-        {"com/tapjoy",                                 "REMOVE_ADS",        "Tapjoy",              "RET_VOID"},
-        {"com/millennialmedia",                        "REMOVE_ADS",        "MillennialMedia",     "RET_VOID"},
-        {"admob",                                      "REMOVE_ADS",        "AdMob marker",        "RET_VOID"},
-        {"DoubleClick",                                "REMOVE_ADS",        "DoubleClick",         "RET_VOID"},
-        {"googleadservices",                           "REMOVE_ADS",        "Google Ad Services",  "RET_VOID"},
-        // ── AD DOMAIN BLOCKING (LuckyPatcher AdsBlockList technique) ─────────
-        {".admob.com",                                 "BLOCK_AD_DOMAINS",  "AdMob domain",        "RET_VOID"},
-        {"doubleclick.net",                            "BLOCK_AD_DOMAINS",  "DoubleClick domain",  "RET_VOID"},
-        {"googlesyndication.com",                      "BLOCK_AD_DOMAINS",  "AdSense domain",      "RET_VOID"},
-        {"amazon-adsystem.com",                        "BLOCK_AD_DOMAINS",  "Amazon Ads domain",   "RET_VOID"},
-        // ── SSL BYPASS (NPManager technique) ──────────────────────────────────
-        {"CertificatePinner",                          "SSL_BYPASS",        "OkHttp pinner",       "RET_VOID"},
-        {"checkServerTrusted",                         "SSL_BYPASS",        "TrustManager server", "RET_VOID"},
-        {"checkClientTrusted",                         "SSL_BYPASS",        "TrustManager client", "RET_VOID"},
-        {"javax/net/ssl/X509TrustManager",             "SSL_BYPASS",        "X509TrustMgr",        "RET_VOID"},
-        {"javax/net/ssl/HostnameVerifier",             "SSL_BYPASS",        "HostnameVerifier",    "RETURN_TRUE"},
-        {"getAcceptedIssuers",                         "SSL_BYPASS",        "cert issuers",        "RET_VOID"},
-        {"SSLContext",                                 "SSL_BYPASS",        "SSLContext",          "RET_VOID"},
-        {"HttpsURLConnection",                         "SSL_BYPASS",        "HttpsURLConn",        "RET_VOID"},
-        // ── ROOT BYPASS (GameGuardian technique) ──────────────────────────────
-        {"isRooted",                                   "ROOT_BYPASS",       "isRooted",            "RETURN_FALSE"},
-        {"RootBeer",                                   "ROOT_BYPASS",       "RootBeer",            "RETURN_FALSE"},
-        {"isDeviceRooted",                             "ROOT_BYPASS",       "isDeviceRooted",      "RETURN_FALSE"},
-        {"checkRootMethod",                            "ROOT_BYPASS",       "checkRootMethod",     "RETURN_FALSE"},
-        {"/system/xbin/su",                            "ROOT_BYPASS",       "su path xbin",        "RET_VOID"},
-        {"/system/bin/su",                             "ROOT_BYPASS",       "su path bin",         "RET_VOID"},
-        {"ro.build.tags",                              "ROOT_BYPASS",       "build tags prop",     "RET_VOID"},
-        {"ro.build.type",                              "ROOT_BYPASS",       "build type prop",     "RET_VOID"},
-        {"test-keys",                                  "ROOT_BYPASS",       "test-keys check",     "RET_VOID"},
-        {"which su",                                   "ROOT_BYPASS",       "which su",            "RET_VOID"},
-        // ── SAFETYNET BYPASS ──────────────────────────────────────────────────
-        {"SafetyNet",                                  "SAFETYNET_BYPASS",  "SafetyNet API",       "RET_VOID"},
-        {"com/google/android/play/core/integrity",     "SAFETYNET_BYPASS",  "Play Integrity",      "RET_VOID"},
-        {"MEETS_DEVICE_INTEGRITY",                     "SAFETYNET_BYPASS",  "Integrity verdict",   "RET_VOID"},
-        {"com/google/android/gms/safetynet",           "SAFETYNET_BYPASS",  "SafetyNet pkg",       "RET_VOID"},
-        {"attest",                                     "SAFETYNET_BYPASS",  "attestation",         "RET_VOID"},
-        {"DroidGuard",                                 "SAFETYNET_BYPASS",  "DroidGuard",          "RET_VOID"},
-        // ── ANTI-FRIDA/DEBUG (JasiPatcher technique) ──────────────────────────
-        {"frida",                                      "FRIDA_BYPASS",      "Frida detect",        "RET_VOID"},
-        {"XposedBridge",                               "FRIDA_BYPASS",      "Xposed framework",    "RET_VOID"},
-        {"de/robv/android/xposed",                     "FRIDA_BYPASS",      "Xposed package",      "RET_VOID"},
-        {"com/saurik/substrate",                       "FRIDA_BYPASS",      "Cydia Substrate",     "RET_VOID"},
-        {"tracerpid",                                  "FRIDA_BYPASS",      "TracerPid anti-debug","RET_VOID"},
-        {"ptrace",                                     "FRIDA_BYPASS",      "ptrace syscall",      "RET_VOID"},
-        {"/proc/self/status",                          "FRIDA_BYPASS",      "/proc/self/status",   "RET_VOID"},
-        {"gadget",                                     "FRIDA_BYPASS",      "Frida gadget",        "RET_VOID"},
-        // ── EMULATOR BYPASS ───────────────────────────────────────────────────
-        {"ro.kernel.qemu",                             "EMULATOR_BYPASS",   "qemu prop",           "RET_VOID"},
-        {"generic",                                    "EMULATOR_BYPASS",   "generic fingerprint", "RET_VOID"},
-        {"goldfish",                                   "EMULATOR_BYPASS",   "goldfish kernel",     "RET_VOID"},
-        {"ranchu",                                     "EMULATOR_BYPASS",   "ranchu kernel",       "RET_VOID"},
-        // ── FLAG_SECURE (JasiPatcher) ─────────────────────────────────────────
-        {"FLAG_SECURE",                                "DISABLE_FLAG_SECURE","FLAG_SECURE const",  "NOP4"},
-        // ── ANALYTICS/TELEMETRY ───────────────────────────────────────────────
-        {"com/google/firebase/analytics",              "DISABLE_ANALYTICS", "Firebase Analytics",  "RET_VOID"},
-        {"com/mixpanel",                               "DISABLE_ANALYTICS", "Mixpanel",            "RET_VOID"},
-        {"com/amplitude",                              "DISABLE_ANALYTICS", "Amplitude",           "RET_VOID"},
-        {"com/adjust",                                 "DISABLE_ANALYTICS", "Adjust",              "RET_VOID"},
-        {"io/sentry",                                  "REMOVE_TELEMETRY",  "Sentry",              "RET_VOID"},
-        {"com/bugsnag",                                "REMOVE_TELEMETRY",  "Bugsnag",             "RET_VOID"},
-        {"com/crashlytics",                            "REMOVE_TELEMETRY",  "Crashlytics",         "RET_VOID"},
-        {"com/google/firebase/crashlytics",            "REMOVE_TELEMETRY",  "Firebase Crash",      "RET_VOID"},
-    };
-
-    // ── Public interface ──────────────────────────────────────────────────────
-
-    public interface Progress { void log(String msg); }
-
-    public static byte[] patch(byte[] dex, Set<String> patchKeys, Progress p) {
-        if (dex == null || dex.length < 0x70) return dex;
-
-        // For very large DEX, use streaming-safe approach
-        if (dex.length > MAX_DEX) {
-            if (p != null) p.log("  Large DEX (" + fmtSize(dex.length) + ") — safe-subset mode");
-            return patchSafe(dex, patchKeys, p);
-        }
-
-        byte[] out = dex.clone();
-        ByteBuffer buf = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN);
-
-        try {
-            // Phase 1: string pool scan
-            int strIdsOff  = buf.getInt(0x38);
-            int strIdsSize = buf.getInt(0x34);
-            Set<Integer> matchedIds   = new HashSet<>();
-            Map<Integer, String> idToStrategy = new HashMap<>();
-
-            for (int i = 0; i < strIdsSize; i++) {
-                int strOff = buf.getInt(strIdsOff + i * 4);
-                if (strOff <= 0 || strOff >= out.length) continue;
-                String str = readMutf8(out, strOff);
-                if (str == null) continue;
-                String lower = str.toLowerCase();
-                for (String[] pat : PATTERNS) {
-                    if (!patchKeys.contains(pat[1])) continue;
-                    if (lower.contains(pat[0].toLowerCase())) {
-                        matchedIds.add(i);
-                        idToStrategy.put(i, pat[3]);
-                    }
-                }
-            }
-
-            if (matchedIds.isEmpty()) return out;
-
-            // Collect matched types for logging
-            Set<String> types = new HashSet<>();
-            for (String[] pat : PATTERNS) {
-                if (patchKeys.contains(pat[1])) types.add(pat[1]);
-            }
-            if (p != null) p.log("  " + matchedIds.size() + " string refs matched");
-
-            // Phase 2: class def walk + method surgery
-            int classDefsOff  = buf.getInt(0x60);
-            int classDefsSize = buf.getInt(0x5c);
-            int patchCount = 0;
-
-            for (int ci = 0; ci < classDefsSize; ci++) {
-                int base = classDefsOff + ci * 32;
-                if (base + 32 > out.length) break;
-                int cdOff = buf.getInt(base + 24);
-                if (cdOff == 0) continue;
-                try {
-                    patchCount += patchClassData(out, cdOff, patchKeys, matchedIds, idToStrategy);
-                } catch (Exception ignored) {}
-            }
-
-            if (p != null) p.log("  " + patchCount + " method(s) patched");
-
-            // Phase 4: recompute checksums
-            recomputeChecksums(out);
-            return out;
-        } catch (Exception e) {
-            Log.w(TAG, "patch(): " + e.getMessage());
-            return dex;
-        }
+    private SuperDexPatcher() {
     }
 
-    private static byte[] patchSafe(byte[] dex, Set<String> keys, Progress p) {
-        // For large DEX: only patch first 10MB (string pool + early classes)
+    private static final String TAG = "AzlukV9.Dex";
+
+    private static final int HEADER_SIZE = 0x70;
+    private static final int CLASS_DEF_SIZE = 32;
+    private static final int METHOD_ID_SIZE = 8;
+    private static final int PROTO_ID_SIZE = 12;
+    private static final int TYPE_ID_SIZE = 4;
+
+    private static final int DEX_ENDIAN_CONSTANT = 0x12345678;
+
+    private static final int ATTR_DEBUGGABLE = 0x0101021b;
+    private static final int ATTR_EXPORTED = 0x010102d4;
+    private static final int ATTR_ALLOW_BACKUP = 0x010100d1;
+    private static final int ATTR_FULL_BACKUP_ONLY = 0x010104eb;
+
+    private static final int RES_STRING_POOL_TYPE = 0x0001;
+    private static final int RES_XML_RESOURCE_MAP_TYPE = 0x0180;
+    private static final int RES_XML_START_ELEMENT_TYPE = 0x0102;
+    private static final int RES_XML_END_ELEMENT_TYPE = 0x0103;
+
+    private static final int TYPE_NULL = 0x00;
+    private static final int TYPE_REFERENCE = 0x01;
+    private static final int TYPE_STRING = 0x03;
+    private static final int TYPE_INT_BOOLEAN = 0x12;
+
+    public interface Progress {
+        void log(String message);
+    }
+
+    /**
+     * Safe recipes currently supported by this binary transformer.
+     *
+     * They are deliberately structural rather than "find a string and patch
+     * the nearest method".
+     */
+    private static final List<Recipe> RECIPES;
+
+    static {
+        List<Recipe> recipes = new ArrayList<>();
+
+        /*
+         * Firebase Analytics.
+         */
+        recipes.add(new Recipe(
+                "DISABLE_ANALYTICS",
+                new String[]{
+                        "Lcom/google/firebase/analytics/FirebaseAnalytics;"
+                },
+                new String[]{
+                        "logEvent"
+                },
+                "V"
+        ));
+
+        /*
+         * Mixpanel.
+         */
+        recipes.add(new Recipe(
+                "DISABLE_ANALYTICS",
+                new String[]{
+                        "Lcom/mixpanel/android/mpmetrics/MixpanelAPI;"
+                },
+                new String[]{
+                        "track",
+                        "trackMap"
+                },
+                "V"
+        ));
+
+        /*
+         * Sentry public API.
+         */
+        recipes.add(new Recipe(
+                "REMOVE_TELEMETRY",
+                new String[]{
+                        "Lio/sentry/Sentry;"
+                },
+                new String[]{
+                        "captureException",
+                        "captureMessage",
+                        "captureEvent"
+                },
+                null
+        ));
+
+        /*
+         * Firebase Crashlytics.
+         */
+        recipes.add(new Recipe(
+                "REMOVE_TELEMETRY",
+                new String[]{
+                        "Lcom/google/firebase/crashlytics/FirebaseCrashlytics;"
+                },
+                new String[]{
+                        "recordException",
+                        "log"
+                },
+                "V"
+        ));
+
+        /*
+         * Bugsnag.
+         */
+        recipes.add(new Recipe(
+                "REMOVE_TELEMETRY",
+                new String[]{
+                        "Lcom/bugsnag/android/Bugsnag;"
+                },
+                new String[]{
+                        "notify"
+                },
+                null
+        ));
+
+        RECIPES = Collections.unmodifiableList(recipes);
+    }
+
+    /**
+     * Parses and transforms a DEX.
+     *
+     * No silent fallback is performed.
+     */
+    public static byte[] patch(
+            byte[] dex,
+            Set<String> patchKeys,
+            Progress progress
+    ) {
+        if (dex == null) {
+            throw new IllegalArgumentException("DEX input is null");
+        }
+
+        if (dex.length < HEADER_SIZE) {
+            throw new IllegalArgumentException(
+                    "DEX is smaller than the minimum header: " + dex.length
+            );
+        }
+
+        if (patchKeys == null || patchKeys.isEmpty()) {
+            /*
+             * Still validate the file. A no-op must not hide malformed DEX data.
+             */
+            new DexFile(dex).validate();
+            return dex.clone();
+        }
+
+        DexFile file = new DexFile(dex);
+        file.validate();
+
         byte[] out = dex.clone();
-        // Apply minimal critical patches inline
-        applyInlinePatches(out, keys);
+
+        log(progress, "DEX header validated");
+        log(progress, "  file_size=" + file.fileSize);
+        log(progress, "  string_ids_size=" + file.stringIdsSize);
+        log(progress, "  type_ids_size=" + file.typeIdsSize);
+        log(progress, "  proto_ids_size=" + file.protoIdsSize);
+        log(progress, "  method_ids_size=" + file.methodIdsSize);
+        log(progress, "  class_defs_size=" + file.classDefsSize);
+
+        int patched = patchMethods(file, out, patchKeys, progress);
+
+        if (patched == 0) {
+            log(progress, "  no structural recipe matched");
+            return dex.clone();
+        }
+
         recomputeChecksums(out);
+
+        /*
+         * Parse the resulting DEX again. This catches accidental structural
+         * corruption before the caller receives it.
+         */
+        new DexFile(out).validate();
+
+        log(progress, "  patched methods=" + patched);
+        log(progress, "  DEX checksum/SHA-1 regenerated");
+
         return out;
     }
 
-    private static void applyInlinePatches(byte[] dex, Set<String> keys) {
-        // Byte-pattern search for critical opcodes without full DEX parse
-        // Scans for iget-object on signatures field — ApkEditorPro bypass
-        if (keys.contains("SIGNATURE_BYPASS")) {
-            // Pattern: iget-object vA, vB, Landroid/content/pm/PackageInfo;->signatures
-            byte[] sig = "signatures".getBytes();
-            int pos = indexOf(dex, sig, dex.length);
-            // Mark surrounding code region as NOP — conservative approach
-            // Full bypass is handled by SmaliInjector for smali-capable flows
+    /**
+     * Conservative binary XML manifest transformer.
+     *
+     * It parses:
+     *   - string pool
+     *   - resource map
+     *   - START_ELEMENT chunks
+     *
+     * It modifies only attributes that already exist in the manifest.
+     * It does not scan for arbitrary byte patterns.
+     */
+    public static byte[] patchManifest(
+            byte[] manifest,
+            Set<String> patchKeys
+    ) {
+        if (manifest == null) {
+            throw new IllegalArgumentException("Manifest is null");
         }
+
+        if (manifest.length < 8) {
+            throw new IllegalArgumentException("Manifest is too small");
+        }
+
+        if (patchKeys == null || patchKeys.isEmpty()) {
+            return manifest.clone();
+        }
+
+        byte[] out = manifest.clone();
+
+        StringPool pool = null;
+        int resourceMapOffset = -1;
+
+        int cursor = 0;
+
+        while (cursor < out.length) {
+            if (cursor + 8 > out.length) {
+                throw new IllegalArgumentException(
+                        "Truncated AXML chunk header at " + cursor
+                );
+            }
+
+            int type = readU16(out, cursor);
+            int headerSize = readU16(out, cursor + 2);
+            int chunkSize = readU32Checked(out, cursor + 4);
+
+            if (headerSize < 8 || chunkSize < headerSize) {
+                throw new IllegalArgumentException(
+                        "Invalid AXML chunk at " + cursor
+                );
+            }
+
+            long endLong = (long) cursor + chunkSize;
+            if (endLong > out.length) {
+                throw new IllegalArgumentException(
+                        "AXML chunk exceeds file at " + cursor
+                );
+            }
+
+            if (type == RES_STRING_POOL_TYPE) {
+                pool = StringPool.parse(out, cursor);
+            } else if (type == RES_XML_RESOURCE_MAP_TYPE) {
+                resourceMapOffset = cursor;
+            }
+
+            cursor += chunkSize;
+        }
+
+        if (pool == null) {
+            throw new IllegalArgumentException("AXML string pool not found");
+        }
+
+        if (resourceMapOffset < 0) {
+            throw new IllegalArgumentException("AXML resource map not found");
+        }
+
+        boolean changed = false;
+
+        cursor = 0;
+        while (cursor < out.length) {
+            int type = readU16(out, cursor);
+            int chunkSize = readU32Checked(out, cursor + 4);
+
+            if (type == RES_XML_START_ELEMENT_TYPE) {
+                changed |= patchStartElement(
+                        out,
+                        cursor,
+                        chunkSize,
+                        pool,
+                        resourceMapOffset,
+                        patchKeys
+                );
+            }
+
+            cursor += chunkSize;
+        }
+
+        return changed ? out : manifest.clone();
     }
 
-    // ── Method patching ───────────────────────────────────────────────────────
+    /**
+     * Kept for source compatibility with the current ApkEngine.
+     *
+     * Domain blocking requires a dedicated string-pool rebuild/relocation
+     * phase. This method therefore deliberately refuses to perform the old
+     * destructive "blank the string" behavior.
+     */
+    public static byte[] applyAdsDomainBlock(
+            byte[] dex,
+            List<String> domains
+    ) {
+        if (dex == null) {
+            throw new IllegalArgumentException("DEX is null");
+        }
 
-    private static int patchClassData(byte[] dex, int off, Set<String> keys,
-                                       Set<Integer> matchedIds, Map<Integer, String> strategies)
-            throws Exception {
-        int[] pos = {off};
-        int patched = 0;
+        /*
+         * Never corrupt DEX string_data in-place.
+         *
+         * A future domain transformation can be implemented as a true
+         * relocation/rebuild operation. Returning an untouched validated copy
+         * is preferable to pretending that a patch happened.
+         */
+        new DexFile(dex).validate();
+        return dex.clone();
+    }
 
-        int sf   = readUleb(dex, pos);
-        int inst = readUleb(dex, pos);
-        int dm   = readUleb(dex, pos);
-        int vm   = readUleb(dex, pos);
-        for (int i = 0; i < sf + inst; i++) { readUleb(dex, pos); readUleb(dex, pos); }
+    /**
+     * Lightweight scan used by ApkEngine.
+     *
+     * It reports only recipes that this implementation can structurally
+     * reason about.
+     */
+    public static List<String[]> quickScan(InputStream input) throws IOException {
+        byte[] data = readAll(input);
+        DexFile file = new DexFile(data);
+        file.validate();
 
-        for (int i = 0; i < dm + vm; i++) {
-            readUleb(dex, pos);
-            readUleb(dex, pos); // accessFlags
-            int codeOff = readUleb(dex, pos);
-            if (codeOff == 0 || codeOff + 16 >= dex.length) continue;
+        List<String[]> result = new ArrayList<>();
 
-            int insnsOff = codeOff + 16;
-            int insnsLen = ByteBuffer.wrap(dex, codeOff + 12, 4)
-                .order(ByteOrder.LITTLE_ENDIAN).getInt() * 2;
-            if (insnsOff + insnsLen > dex.length || insnsLen < 2) continue;
+        Set<String> available = new HashSet<>();
 
-            // Scan for const-string refs to matched string IDs
-            boolean hasMatch = false;
-            String strategy  = "RET_VOID";
-            outer:
-            for (int ip = insnsOff; ip < insnsOff + insnsLen - 1; ) {
-                int op = dex[ip] & 0xFF;
-                if (op == 0x1a && ip + 3 < dex.length) {
-                    int si = (dex[ip+2] & 0xFF) | ((dex[ip+3] & 0xFF) << 8);
-                    if (matchedIds.contains(si)) {
-                        hasMatch = true;
-                        strategy = strategies.getOrDefault(si, "RET_VOID");
-                        break outer;
-                    }
-                    ip += 4;
-                } else if (op == 0x1b && ip + 5 < dex.length) {
-                    int si = ByteBuffer.wrap(dex, ip + 2, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
-                    if (matchedIds.contains(si)) {
-                        hasMatch = true;
-                        strategy = strategies.getOrDefault(si, "RET_VOID");
-                        break outer;
-                    }
-                    ip += 6;
-                } else { ip += 2; }
-            }
-
-            if (!hasMatch) continue;
-
-            // Apply strategy
-            switch (strategy) {
-                case "RET_VOID":
-                    if (insnsOff + 1 < dex.length) {
-                        dex[insnsOff] = RET_VOID; dex[insnsOff+1] = 0;
-                        patched++;
-                    }
-                    break;
-                case "RETURN_FALSE":
-                case "RETURN_ZERO":
-                    if (insnsOff + 3 < dex.length) {
-                        dex[insnsOff] = CONST4; dex[insnsOff+1] = 0x00; // const/4 v0, 0
-                        dex[insnsOff+2] = RETURN; dex[insnsOff+3] = 0x00; // return v0
-                        patched++;
-                    }
-                    break;
-                case "RETURN_TRUE":
-                    if (insnsOff + 3 < dex.length) {
-                        dex[insnsOff] = CONST4; dex[insnsOff+1] = 0x01; // const/4 v0, 1
-                        dex[insnsOff+2] = RETURN; dex[insnsOff+3] = 0x00;
-                        patched++;
-                    }
-                    break;
-                case "NOP4":
-                    if (insnsOff + 3 < dex.length) {
-                        dex[insnsOff] = 0; dex[insnsOff+1] = 0;
-                        dex[insnsOff+2] = 0; dex[insnsOff+3] = 0;
-                        patched++;
-                    }
-                    break;
+        for (Recipe recipe : RECIPES) {
+            if (containsRecipeTarget(file, recipe)) {
+                available.add(recipe.key);
             }
         }
+
+        for (String key : available) {
+            result.add(new String[]{
+                    key,
+                    "Structural recipe available"
+            });
+        }
+
+        return result;
+    }
+
+    // -------------------------------------------------------------------------
+    // DEX method analysis
+    // -------------------------------------------------------------------------
+
+    private static int patchMethods(
+            DexFile file,
+            byte[] out,
+            Set<String> patchKeys,
+            Progress progress
+    ) {
+        int patched = 0;
+
+        for (int classIndex = 0; classIndex < file.classDefsSize; classIndex++) {
+            int classDef = file.classDefsOff + classIndex * CLASS_DEF_SIZE;
+
+            int classTypeIndex = file.readU32(classDef);
+
+            String classDescriptor = file.getTypeDescriptor(classTypeIndex);
+
+            int classDataOff = file.readU32(classDef + 24);
+
+            if (classDataOff == 0) {
+                continue;
+            }
+
+            checkRange(
+                    classDataOff,
+                    1,
+                    out.length,
+                    "class_data"
+            );
+
+            ClassData data = parseClassData(file, out, classDataOff);
+
+            for (EncodedMethod method : data.methods) {
+                MethodInfo info = file.getMethodInfo(method.methodIndex);
+
+                Recipe recipe = findRecipe(
+                        patchKeys,
+                        classDescriptor,
+                        info.name
+                );
+
+                if (recipe == null) {
+                    continue;
+                }
+
+                if (recipe.expectedReturnType != null &&
+                        !recipe.expectedReturnType.equals(info.returnDescriptor)) {
+                    continue;
+                }
+
+                if (method.codeOffset == 0) {
+                    continue;
+                }
+
+                CodeItem code = CodeItem.parse(out, method.codeOffset);
+
+                if (code.triesSize != 0) {
+                    /*
+                     * Replacing a method containing try/catch regions without
+                     * rebuilding handlers is unsafe.
+                     */
+                    log(
+                            progress,
+                            "  skip " + classDescriptor + "->" +
+                                    info.name + ": tries_size != 0"
+                    );
+                    continue;
+                }
+
+                int requiredUnits = requiredCodeUnits(info.returnDescriptor);
+
+                if (code.insnsSize < requiredUnits) {
+                    log(
+                            progress,
+                            "  skip " + classDescriptor + "->" +
+                                    info.name + ": insufficient insns_size"
+                    );
+                    continue;
+                }
+
+                emitReturnStub(
+                        out,
+                        code.insnsOffset,
+                        code.insnsSize,
+                        code.registersSize,
+                        info.returnDescriptor
+                );
+
+                patched++;
+
+                log(
+                        progress,
+                        "  patched " +
+                                classDescriptor +
+                                "->" +
+                                info.name +
+                                " " +
+                                info.returnDescriptor
+                );
+            }
+        }
+
         return patched;
     }
 
-    // ── Manifest patcher ──────────────────────────────────────────────────────
+    private static boolean containsRecipeTarget(
+            DexFile file,
+            Recipe recipe
+    ) {
+        for (int classIndex = 0; classIndex < file.classDefsSize; classIndex++) {
+            int classDef = file.classDefsOff + classIndex * CLASS_DEF_SIZE;
+            int typeIndex = file.readU32(classDef);
 
-    public static byte[] patchManifest(byte[] xml, Set<String> keys) {
-        if (xml == null || xml.length < 8) return xml;
-        byte[] out = xml.clone();
-        ByteBuffer buf = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN);
-        for (int i = 0; i <= out.length - 20; i += 4) {
-            try {
-                int attrId = buf.getInt(i);
-                if (keys.contains("FORCE_DEBUGGABLE")      && attrId == ATTR_DEBUGGABLE)  buf.putInt(i+16, 0xFFFFFFFF);
-                if (keys.contains("EXPORT_ALL_COMPONENTS") && attrId == ATTR_EXPORTED)    buf.putInt(i+16, 0xFFFFFFFF);
-                if (keys.contains("ALLOW_BACKUP")          && attrId == ATTR_ALLOW_BACK)  buf.putInt(i+16, 0xFFFFFFFF);
-                if (keys.contains("ALLOW_BACKUP")          && attrId == ATTR_FULL_BACK)   buf.putInt(i+16, 0x00000000);
-                if (keys.contains("DISABLE_FLAG_SECURE")   && attrId == ATTR_FLAG_SECURE) buf.putInt(i+16, 0x00000000);
-            } catch (Exception ignored) {}
-        }
-        return out;
-    }
+            String descriptor = file.getTypeDescriptor(typeIndex);
 
-    // ── OkHttp network domain blocker (LuckyPatcher AdsBlockList technique) ──
-    // Scans for network-related string constants and nulls out domain strings
-
-    public static byte[] applyAdsDomainBlock(byte[] dex, List<String> blockedDomains) {
-        if (dex == null || dex.length < 0x70) return dex;
-        byte[] out = dex.clone();
-        ByteBuffer buf = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN);
-        int strIdsOff  = buf.getInt(0x38);
-        int strIdsSize = buf.getInt(0x34);
-        for (int i = 0; i < strIdsSize; i++) {
-            try {
-                int strOff = buf.getInt(strIdsOff + i * 4);
-                if (strOff <= 0 || strOff >= out.length) continue;
-                String str = readMutf8(out, strOff);
-                if (str == null) continue;
-                for (String domain : blockedDomains) {
-                    if (str.contains(domain)) {
-                        // Zero out the string data bytes (keeps length field intact)
-                        int[] pos = {strOff};
-                        readUleb(out, pos); // skip length
-                        int dataStart = pos[0];
-                        int dataEnd   = Math.min(dataStart + str.length(), out.length);
-                        Arrays.fill(out, dataStart, dataEnd, (byte) 0x20); // replace with spaces
-                        break;
-                    }
-                }
-            } catch (Exception ignored) {}
-        }
-        recomputeChecksums(out);
-        return out;
-    }
-
-    // ── Streaming scanner ─────────────────────────────────────────────────────
-
-    public static List<String[]> quickScan(InputStream stream) throws IOException {
-        final int CHUNK = 131072, OVERLAP = 512;
-        byte[] buf = new byte[CHUNK + OVERLAP], prev = new byte[OVERLAP];
-        int prevLen = 0; boolean first = true;
-        Set<String> found = new HashSet<>(); List<String[]> results = new ArrayList<>();
-        while (true) {
-            System.arraycopy(prev, 0, buf, 0, prevLen);
-            int read = 0;
-            while (read < CHUNK) { int n = stream.read(buf, prevLen+read, CHUNK-read); if (n==-1) break; read+=n; }
-            if (read == 0 && prevLen == 0) break;
-            int avail = prevLen + read;
-            if (first) {
-                first = false;
-                if (avail < 4 || buf[0]!=0x64||buf[1]!=0x65||buf[2]!=0x78||buf[3]!=0x0a) break;
+            if (!recipe.matchesClass(descriptor)) {
+                continue;
             }
-            for (String[] pat : PATTERNS) {
-                String key = pat[1]+"|"+pat[2];
-                if (found.contains(key)) continue;
-                if (indexOf(buf, pat[0].getBytes("UTF-8"), avail) >= 0) {
-                    found.add(key); results.add(new String[]{pat[1], pat[2]});
+
+            int classDataOff = file.readU32(classDef + 24);
+
+            if (classDataOff == 0) {
+                continue;
+            }
+
+            ClassData data = parseClassData(file, file.bytes, classDataOff);
+
+            for (EncodedMethod method : data.methods) {
+                MethodInfo info = file.getMethodInfo(method.methodIndex);
+
+                if (recipe.matchesMethod(info.name)) {
+                    return true;
                 }
             }
-            prevLen = Math.min(OVERLAP, avail);
-            System.arraycopy(buf, avail-prevLen, prev, 0, prevLen);
-            if (read < CHUNK) break;
         }
-        return results;
+
+        return false;
     }
 
-    // ── DEX checksums ─────────────────────────────────────────────────────────
+    private static Recipe findRecipe(
+            Set<String> patchKeys,
+            String classDescriptor,
+            String methodName
+    ) {
+        for (Recipe recipe : RECIPES) {
+            if (!patchKeys.contains(recipe.key)) {
+                continue;
+            }
+
+            if (!recipe.matchesClass(classDescriptor)) {
+                continue;
+            }
+
+            if (!recipe.matchesMethod(methodName)) {
+                continue;
+            }
+
+            return recipe;
+        }
+
+        return null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Method code generation
+    // -------------------------------------------------------------------------
+
+    private static int requiredCodeUnits(String returnType) {
+        if ("V".equals(returnType)) {
+            return 1;
+        }
+
+        if ("J".equals(returnType) || "D".equals(returnType)) {
+            return 3;
+        }
+
+        return 2;
+    }
+
+    private static void emitReturnStub(
+            byte[] data,
+            int offset,
+            int insnsSize,
+            int registersSize,
+            String returnType
+    ) {
+        if (insnsSize <= 0) {
+            throw new IllegalArgumentException("Invalid zero-length method");
+        }
+
+        /*
+         * Fill the entire instruction stream with NOP first.
+         * This avoids leaving dead original instructions behind.
+         */
+        for (int i = 0; i < insnsSize * 2; i++) {
+            data[offset + i] = 0;
+        }
+
+        if ("V".equals(returnType)) {
+            /*
+             * return-void
+             */
+            writeU16(data, offset, 0x000e);
+            return;
+        }
+
+        if (registersSize == 0) {
+            throw new IllegalArgumentException(
+                    "Cannot synthesize non-void return without a register"
+            );
+        }
+
+        if ("J".equals(returnType) || "D".equals(returnType)) {
+            /*
+             * const-wide/16 v0, #0
+             * return-wide v0
+             *
+             * 0x0016
+             * 0x0000
+             * 0x0010
+             */
+            writeU16(data, offset, 0x0016);
+            writeU16(data, offset + 2, 0x0000);
+            writeU16(data, offset + 4, 0x0010);
+            return;
+        }
+
+        /*
+         * const/4 v0, #0
+         * return v0
+         *
+         * const/4 format: op | A | B
+         * vA=0, literal=0 => 0x0012
+         */
+        writeU16(data, offset, 0x0012);
+        writeU16(data, offset + 2, 0x000f);
+
+        if (returnType.startsWith("L") || returnType.startsWith("[")) {
+            /*
+             * For object/array return types the opcode must be return-object.
+             */
+            writeU16(data, offset + 2, 0x0011);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Class data
+    // -------------------------------------------------------------------------
+
+    private static ClassData parseClassData(
+            DexFile file,
+            byte[] data,
+            int offset
+    ) {
+        Cursor cursor = new Cursor(data, offset);
+
+        int staticFields = cursor.readUleb128();
+        int instanceFields = cursor.readUleb128();
+        int directMethods = cursor.readUleb128();
+        int virtualMethods = cursor.readUleb128();
+
+        for (int i = 0; i < staticFields; i++) {
+            cursor.readUleb128();
+            cursor.readUleb128();
+        }
+
+        for (int i = 0; i < instanceFields; i++) {
+            cursor.readUleb128();
+            cursor.readUleb128();
+        }
+
+        List<EncodedMethod> methods = new ArrayList<>();
+
+        int previousMethodIndex = 0;
+
+        for (int i = 0; i < directMethods; i++) {
+            int delta = cursor.readUleb128();
+            int accessFlags = cursor.readUleb128();
+            int codeOffset = cursor.readUleb128();
+
+            previousMethodIndex += delta;
+
+            methods.add(new EncodedMethod(
+                    previousMethodIndex,
+                    accessFlags,
+                    codeOffset
+            ));
+        }
+
+        previousMethodIndex = 0;
+
+        for (int i = 0; i < virtualMethods; i++) {
+            int delta = cursor.readUleb128();
+            int accessFlags = cursor.readUleb128();
+            int codeOffset = cursor.readUleb128();
+
+            previousMethodIndex += delta;
+
+            methods.add(new EncodedMethod(
+                    previousMethodIndex,
+                    accessFlags,
+                    codeOffset
+            ));
+        }
+
+        return new ClassData(methods);
+    }
+
+    // -------------------------------------------------------------------------
+    // Binary XML
+    // -------------------------------------------------------------------------
+
+    private static boolean patchStartElement(
+            byte[] data,
+            int chunkOffset,
+            int chunkSize,
+            StringPool pool,
+            int resourceMapOffset,
+            Set<String> keys
+    ) {
+        /*
+         * START_ELEMENT:
+         *
+         * ResXMLTree_node
+         *   type          u16
+         *   headerSize    u16
+         *   size          u32
+         *   lineNumber    u32
+         *   comment       u32
+         *
+         * ResXMLTree_attrExt
+         *   ns            u32
+         *   name          u32
+         *   attributeStart u16
+         *   attributeSize  u16
+         *   attributeCount u16
+         *   idIndex        u16
+         *   classIndex     u16
+         *   styleIndex     u16
+         *
+         * followed by attributes.
+         */
+
+        if (chunkOffset + 36 > data.length) {
+            throw new IllegalArgumentException("Truncated START_ELEMENT");
+        }
+
+        int nodeHeaderSize = readU16(data, chunkOffset + 2);
+
+        if (nodeHeaderSize < 16) {
+            throw new IllegalArgumentException(
+                    "Invalid XML node header"
+            );
+        }
+
+        int ext = chunkOffset + nodeHeaderSize;
+
+        if (ext + 20 > data.length) {
+            throw new IllegalArgumentException(
+                    "Truncated START_ELEMENT extension"
+            );
+        }
+
+        int attributeStart = readU16(data, ext + 8);
+        int attributeSize = readU16(data, ext + 10);
+        int attributeCount = readU16(data, ext + 12);
+
+        if (attributeSize < 20) {
+            throw new IllegalArgumentException(
+                    "Unsupported AXML attribute size: " + attributeSize
+            );
+        }
+
+        int attributesBase = ext + attributeStart;
+
+        long end = (long) attributesBase +
+                (long) attributeCount * attributeSize;
+
+        if (attributesBase < 0 || end > chunkOffset + chunkSize ||
+                end > data.length) {
+            throw new IllegalArgumentException(
+                    "START_ELEMENT attributes exceed chunk"
+            );
+        }
+
+        boolean changed = false;
+
+        for (int i = 0; i < attributeCount; i++) {
+            int attr = attributesBase + i * attributeSize;
+
+            int nameStringIndex = readU32(data, attr + 4);
+
+            int resourceId = resolveResourceId(
+                    data,
+                    resourceMapOffset,
+                    nameStringIndex
+            );
+
+            if (resourceId == ATTR_DEBUGGABLE &&
+                    keys.contains("FORCE_DEBUGGABLE")) {
+
+                writeBooleanValue(data, attr, true);
+                changed = true;
+            }
+
+            if (resourceId == ATTR_EXPORTED &&
+                    keys.contains("EXPORT_ALL_COMPONENTS")) {
+
+                writeBooleanValue(data, attr, true);
+                changed = true;
+            }
+
+            if (resourceId == ATTR_ALLOW_BACKUP &&
+                    keys.contains("ALLOW_BACKUP")) {
+
+                writeBooleanValue(data, attr, true);
+                changed = true;
+            }
+
+            if (resourceId == ATTR_FULL_BACKUP_ONLY &&
+                    keys.contains("ALLOW_BACKUP")) {
+
+                writeBooleanValue(data, attr, false);
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private static int resolveResourceId(
+            byte[] data,
+            int resourceMapOffset,
+            int stringIndex
+    ) {
+        int headerSize = readU16(data, resourceMapOffset + 2);
+        int mapBase = resourceMapOffset + headerSize;
+
+        long offset = (long) mapBase + (long) stringIndex * 4L;
+
+        if (offset < 0 || offset + 4 > data.length) {
+            return 0;
+        }
+
+        return readU32(data, (int) offset);
+    }
+
+    private static void writeBooleanValue(
+            byte[] data,
+            int attributeOffset,
+            boolean value
+    ) {
+        /*
+         * Attribute:
+         *   ns         +0
+         *   name       +4
+         *   rawValue  +8
+         *   typedValue +12
+         *
+         * typedValue:
+         *   size       +0
+         *   res0       +2
+         *   dataType   +3
+         *   data       +4
+         */
+
+        writeU16(data, attributeOffset + 12, 8);
+        data[attributeOffset + 14] = 0;
+        data[attributeOffset + 15] = TYPE_INT_BOOLEAN;
+        writeU32(
+                data,
+                attributeOffset + 16,
+                value ? 1 : 0
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // DEX checksum
+    // -------------------------------------------------------------------------
 
     public static void recomputeChecksums(byte[] dex) {
-        if (dex.length < 0x70) return;
+        if (dex.length < HEADER_SIZE) {
+            throw new IllegalArgumentException("DEX too small");
+        }
+
         try {
             MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
-            sha1.update(dex, 32, dex.length - 32);
-            System.arraycopy(sha1.digest(), 0, dex, 12, 20);
+
+            sha1.update(
+                    dex,
+                    32,
+                    dex.length - 32
+            );
+
+            byte[] digest = sha1.digest();
+
+            System.arraycopy(
+                    digest,
+                    0,
+                    dex,
+                    12,
+                    digest.length
+            );
+
             Adler32 adler = new Adler32();
-            adler.update(dex, 12, dex.length - 12);
-            long cs = adler.getValue();
-            dex[8]=(byte)(cs&0xFF); dex[9]=(byte)((cs>>8)&0xFF);
-            dex[10]=(byte)((cs>>16)&0xFF); dex[11]=(byte)((cs>>24)&0xFF);
-        } catch (Exception e) { Log.w(TAG, e.getMessage()); }
-    }
+            adler.update(
+                    dex,
+                    12,
+                    dex.length - 12
+            );
 
-    // ── ULEB128 ───────────────────────────────────────────────────────────────
-
-    static int readUleb(byte[] buf, int[] pos) {
-        int v=0,s=0;
-        while (pos[0]<buf.length) { int b=buf[pos[0]++]&0xFF; v|=(b&0x7F)<<s; s+=7; if((b&0x80)==0) break; }
-        return v;
-    }
-
-    private static String readMutf8(byte[] dex, int off) {
-        int[] pos={off}; int len=readUleb(dex,pos);
-        if (len<=0||len>65536||pos[0]+len>dex.length) return null;
-        try { return new String(dex,pos[0],len,"UTF-8"); } catch(Exception e){return null;}
-    }
-
-    static int indexOf(byte[] buf, byte[] pat, int len) {
-        int end=Math.min(len,buf.length)-pat.length;
-        outer: for(int i=0;i<=Math.max(0,end);i++){
-            for(int j=0;j<pat.length;j++) if(buf[i+j]!=pat[j]) continue outer;
-            return i;
+            writeU32(
+                    dex,
+                    8,
+                    (int) adler.getValue()
+            );
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    "Unable to recompute DEX checksum",
+                    e
+            );
         }
-        return -1;
     }
 
-    private static String fmtSize(long b) {
-        if (b<1024) return b+"B";
-        if (b<1024*1024) return String.format("%.1fKB",b/1024f);
-        return String.format("%.1fMB",b/(1024f*1024));
+    // -------------------------------------------------------------------------
+    // DEX file model
+    // -------------------------------------------------------------------------
+
+    private static final class DexFile {
+
+        final byte[] bytes;
+
+        final int fileSize;
+        final int headerSize;
+
+        final int stringIdsSize;
+        final int stringIdsOff;
+
+        final int typeIdsSize;
+        final int typeIdsOff;
+
+        final int protoIdsSize;
+        final int protoIdsOff;
+
+        final int methodIdsSize;
+        final int methodIdsOff;
+
+        final int classDefsSize;
+        final int classDefsOff;
+
+        final int dataSize;
+        final int dataOff;
+
+        DexFile(byte[] bytes) {
+            this.bytes = bytes;
+
+            fileSize = readU32Checked(bytes, 0x20);
+            headerSize = readU32Checked(bytes, 0x24);
+
+            stringIdsSize = readU32Checked(bytes, 0x38);
+            stringIdsOff = readU32Checked(bytes, 0x3c);
+
+            typeIdsSize = readU32Checked(bytes, 0x40);
+            typeIdsOff = readU32Checked(bytes, 0x44);
+
+            protoIdsSize = readU32Checked(bytes, 0x48);
+            protoIdsOff = readU32Checked(bytes, 0x4c);
+
+            methodIdsSize = readU32Checked(bytes, 0x58);
+            methodIdsOff = readU32Checked(bytes, 0x5c);
+
+            classDefsSize = readU32Checked(bytes, 0x60);
+            classDefsOff = readU32Checked(bytes, 0x64);
+
+            dataSize = readU32Checked(bytes, 0x68);
+            dataOff = readU32Checked(bytes, 0x6c);
+        }
+
+        void validate() {
+            if (bytes.length < HEADER_SIZE) {
+                throw new IllegalArgumentException("DEX header truncated");
+            }
+
+            if (bytes[0] != 'd' ||
+                    bytes[1] != 'e' ||
+                    bytes[2] != 'x' ||
+                    bytes[3] != '\n') {
+                throw new IllegalArgumentException("Invalid DEX magic");
+            }
+
+            if (bytes[7] != 0) {
+                throw new IllegalArgumentException("Invalid DEX magic terminator");
+            }
+
+            if (headerSize != HEADER_SIZE) {
+                throw new IllegalArgumentException(
+                        "Unsupported DEX header size: " + headerSize
+                );
+            }
+
+            int endian = readU32Checked(bytes, 0x28);
+
+            if (endian != DEX_ENDIAN_CONSTANT) {
+                throw new IllegalArgumentException(
+                        "Unsupported DEX endian tag: 0x" +
+                                Integer.toHexString(endian)
+                );
+            }
+
+            if (fileSize != bytes.length) {
+                throw new IllegalArgumentException(
+                        "DEX file_size mismatch: header=" +
+                                fileSize +
+                                " actual=" +
+                                bytes.length
+                );
+            }
+
+            if (dataOff < HEADER_SIZE ||
+                    dataOff > bytes.length ||
+                    dataSize < 0 ||
+                    (long) dataOff + dataSize > bytes.length) {
+
+                throw new IllegalArgumentException(
+                        "Invalid DEX data section"
+                );
+            }
+
+            validateTable(
+                    "string_ids",
+                    stringIdsSize,
+                    stringIdsOff,
+                    4
+            );
+
+            validateTable(
+                    "type_ids",
+                    typeIdsSize,
+                    typeIdsOff,
+                    TYPE_ID_SIZE
+            );
+
+            validateTable(
+                    "proto_ids",
+                    protoIdsSize,
+                    protoIdsOff,
+                    PROTO_ID_SIZE
+            );
+
+            validateTable(
+                    "method_ids",
+                    methodIdsSize,
+                    methodIdsOff,
+                    METHOD_ID_SIZE
+            );
+
+            validateTable(
+                    "class_defs",
+                    classDefsSize,
+                    classDefsOff,
+                    CLASS_DEF_SIZE
+            );
+        }
+
+        private void validateTable(
+                String name,
+                int count,
+                int offset,
+                int elementSize
+        ) {
+            if (count == 0) {
+                if (offset != 0 && offset >= bytes.length) {
+                    throw new IllegalArgumentException(
+                            "Invalid empty " + name + " offset"
+                    );
+                }
+                return;
+            }
+
+            if (offset < HEADER_SIZE) {
+                throw new IllegalArgumentException(
+                        name + " offset points inside header"
+                );
+            }
+
+            long end =
+                    (long) offset +
+                            (long) count * elementSize;
+
+            if (end > bytes.length) {
+                throw new IllegalArgumentException(
+                        name + " table exceeds file"
+                );
+            }
+
+            if ((offset & 3) != 0) {
+                throw new IllegalArgumentException(
+                        name + " offset is not 4-byte aligned"
+                );
+            }
+        }
+
+        int readU32(int offset) {
+            return readU32Checked(bytes, offset);
+        }
+
+        String getString(int index) {
+            if (index < 0 || index >= stringIdsSize) {
+                throw new IllegalArgumentException(
+                        "string index out of range: " + index
+                );
+            }
+
+            int stringOffset = readU32(
+                    stringIdsOff + index * 4
+            );
+
+            checkRange(
+                    stringOffset,
+                    1,
+                    bytes.length,
+                    "string_data"
+            );
+
+            return readMutf8(bytes, stringOffset);
+        }
+
+        String getTypeDescriptor(int typeIndex) {
+            if (typeIndex < 0 || typeIndex >= typeIdsSize) {
+                throw new IllegalArgumentException(
+                        "type index out of range: " + typeIndex
+                );
+            }
+
+            int descriptorIndex =
+                    readU32(typeIdsOff + typeIndex * 4);
+
+            return getString(descriptorIndex);
+        }
+
+        MethodInfo getMethodInfo(int methodIndex) {
+            if (methodIndex < 0 || methodIndex >= methodIdsSize) {
+                throw new IllegalArgumentException(
+                        "method index out of range: " + methodIndex
+                );
+            }
+
+            int offset =
+                    methodIdsOff +
+                            methodIndex * METHOD_ID_SIZE;
+
+            int classIndex = readU16(bytes, offset);
+            int protoIndex = readU16(bytes, offset + 2);
+            int nameIndex = readU32(offset + 4);
+
+            String name = getString(nameIndex);
+
+            if (protoIndex < 0 ||
+                    protoIndex >= protoIdsSize) {
+                throw new IllegalArgumentException(
+                        "proto index out of range"
+                );
+            }
+
+            int protoOffset =
+                    protoIdsOff +
+                            protoIndex * PROTO_ID_SIZE;
+
+            int returnTypeIndex =
+                    readU32(protoOffset + 8);
+
+            String returnDescriptor =
+                    getTypeDescriptor(returnTypeIndex);
+
+            return new MethodInfo(
+                    methodIndex,
+                    classIndex,
+                    protoIndex,
+                    name,
+                    returnDescriptor
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // MUTF-8
+    // -------------------------------------------------------------------------
+
+    private static String readMutf8(
+            byte[] data,
+            int offset
+    ) {
+        Cursor cursor = new Cursor(data, offset);
+
+        int declaredUtf16Length =
+                cursor.readUleb128();
+
+        StringBuilder out =
+                new StringBuilder(declaredUtf16Length);
+
+        boolean terminated = false;
+
+        while (cursor.position < data.length) {
+            int b = data[cursor.position++] & 0xff;
+
+            if (b == 0) {
+                terminated = true;
+                break;
+            }
+
+            if ((b & 0x80) == 0) {
+                out.append((char) b);
+                continue;
+            }
+
+            if ((b & 0xe0) == 0xc0) {
+                requireBytes(cursor, 1);
+
+                int b2 =
+                        data[cursor.position++] & 0xff;
+
+                if (b == 0xc0 && b2 == 0x80) {
+                    out.append('\u0000');
+                } else {
+                    if ((b2 & 0xc0) != 0x80) {
+                        throw new IllegalArgumentException(
+                                "Invalid MUTF-8 continuation byte"
+                        );
+                    }
+
+                    int value =
+                            ((b & 0x1f) << 6) |
+                                    (b2 & 0x3f);
+
+                    out.append((char) value);
+                }
+
+                continue;
+            }
+
+            if ((b & 0xf0) == 0xe0) {
+                requireBytes(cursor, 2);
+
+                int b2 =
+                        data[cursor.position++] & 0xff;
+
+                int b3 =
+                        data[cursor.position++] & 0xff;
+
+                if ((b2 & 0xc0) != 0x80 ||
+                        (b3 & 0xc0) != 0x80) {
+                    throw new IllegalArgumentException(
+                            "Invalid MUTF-8 sequence"
+                    );
+                }
+
+                int value =
+                        ((b & 0x0f) << 12) |
+                                ((b2 & 0x3f) << 6) |
+                                (b3 & 0x3f);
+
+                out.append((char) value);
+                continue;
+            }
+
+            throw new IllegalArgumentException(
+                    "Unsupported MUTF-8 leading byte 0x" +
+                            Integer.toHexString(b)
+            );
+        }
+
+        if (!terminated) {
+            throw new IllegalArgumentException(
+                    "DEX string has no NUL terminator"
+            );
+        }
+
+        return out.toString();
+    }
+
+    private static void requireBytes(
+            Cursor cursor,
+            int count
+    ) {
+        if (cursor.position + count > cursor.data.length) {
+            throw new IllegalArgumentException(
+                    "Truncated MUTF-8 string"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Code item
+    // -------------------------------------------------------------------------
+
+    private static final class CodeItem {
+
+        final int registersSize;
+        final int insSize;
+        final int outsSize;
+        final int triesSize;
+        final int insnsSize;
+        final int insnsOffset;
+
+        private CodeItem(
+                int registersSize,
+                int insSize,
+                int outsSize,
+                int triesSize,
+                int insnsSize,
+                int insnsOffset
+        ) {
+            this.registersSize = registersSize;
+            this.insSize = insSize;
+            this.outsSize = outsSize;
+            this.triesSize = triesSize;
+            this.insnsSize = insnsSize;
+            this.insnsOffset = insnsOffset;
+        }
+
+        static CodeItem parse(
+                byte[] data,
+                int offset
+        ) {
+            checkRange(
+                    offset,
+                    16,
+                    data.length,
+                    "code_item"
+            );
+
+            int registersSize =
+                    readU16(data, offset);
+
+            int insSize =
+                    readU16(data, offset + 2);
+
+            int outsSize =
+                    readU16(data, offset + 4);
+
+            int triesSize =
+                    readU16(data, offset + 6);
+
+            int insnsSize =
+                    readU32Checked(data, offset + 12);
+
+            int insnsOffset = offset + 16;
+
+            long end =
+                    (long) insnsOffset +
+                            (long) insnsSize * 2L;
+
+            if (end > data.length) {
+                throw new IllegalArgumentException(
+                        "code_item instructions exceed DEX"
+                );
+            }
+
+            return new CodeItem(
+                    registersSize,
+                    insSize,
+                    outsSize,
+                    triesSize,
+                    insnsSize,
+                    insnsOffset
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Recipe / model
+    // -------------------------------------------------------------------------
+
+    private static final class Recipe {
+
+        final String key;
+        final String[] classes;
+        final String[] methods;
+        final String expectedReturnType;
+
+        Recipe(
+                String key,
+                String[] classes,
+                String[] methods,
+                String expectedReturnType
+        ) {
+            this.key = key;
+            this.classes = classes;
+            this.methods = methods;
+            this.expectedReturnType = expectedReturnType;
+        }
+
+        boolean matchesClass(String descriptor) {
+            for (String candidate : classes) {
+                if (candidate.equals(descriptor)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        boolean matchesMethod(String name) {
+            for (String candidate : methods) {
+                if (candidate.equals(name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    private static final class MethodInfo {
+
+        final int methodIndex;
+        final int classIndex;
+        final int protoIndex;
+        final String name;
+        final String returnDescriptor;
+
+        MethodInfo(
+                int methodIndex,
+                int classIndex,
+                int protoIndex,
+                String name,
+                String returnDescriptor
+        ) {
+            this.methodIndex = methodIndex;
+            this.classIndex = classIndex;
+            this.protoIndex = protoIndex;
+            this.name = name;
+            this.returnDescriptor = returnDescriptor;
+        }
+    }
+
+    private static final class EncodedMethod {
+
+        final int methodIndex;
+        final int accessFlags;
+        final int codeOffset;
+
+        EncodedMethod(
+                int methodIndex,
+                int accessFlags,
+                int codeOffset
+        ) {
+            this.methodIndex = methodIndex;
+            this.accessFlags = accessFlags;
+            this.codeOffset = codeOffset;
+        }
+    }
+
+    private static final class ClassData {
+
+        final List<EncodedMethod> methods;
+
+        ClassData(List<EncodedMethod> methods) {
+            this.methods = methods;
+        }
+    }
+
+    private static final class Cursor {
+
+        final byte[] data;
+        int position;
+
+        Cursor(byte[] data, int position) {
+            this.data = data;
+            this.position = position;
+        }
+
+        int readUleb128() {
+            int result = 0;
+            int shift = 0;
+
+            for (int i = 0; i < 5; i++) {
+                if (position >= data.length) {
+                    throw new IllegalArgumentException(
+                            "Truncated ULEB128"
+                    );
+                }
+
+                int b = data[position++] & 0xff;
+
+                result |=
+                        (b & 0x7f) << shift;
+
+                if ((b & 0x80) == 0) {
+                    return result;
+                }
+
+                shift += 7;
+            }
+
+            throw new IllegalArgumentException(
+                    "ULEB128 exceeds 5 bytes"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // String pool parser for AXML
+    // -------------------------------------------------------------------------
+
+    private static final class StringPool {
+
+        final int chunkOffset;
+        final int chunkSize;
+        final int stringCount;
+        final int flags;
+        final int stringsStart;
+        final int[] offsets;
+
+        private StringPool(
+                int chunkOffset,
+                int chunkSize,
+                int stringCount,
+                int flags,
+                int stringsStart,
+                int[] offsets
+        ) {
+            this.chunkOffset = chunkOffset;
+            this.chunkSize = chunkSize;
+            this.stringCount = stringCount;
+            this.flags = flags;
+            this.stringsStart = stringsStart;
+            this.offsets = offsets;
+        }
+
+        static StringPool parse(
+                byte[] data,
+                int offset
+        ) {
+            int headerSize =
+                    readU16(data, offset + 2);
+
+            int chunkSize =
+                    readU32Checked(data, offset + 4);
+
+            int stringCount =
+                    readU32Checked(data, offset + 8);
+
+            int flags =
+                    readU32Checked(data, offset + 16);
+
+            int stringsStart =
+                    readU32Checked(data, offset + 20);
+
+            if (headerSize < 28) {
+                throw new IllegalArgumentException(
+                        "Invalid string pool header"
+                );
+            }
+
+            if (stringCount < 0) {
+                throw new IllegalArgumentException(
+                        "Invalid string count"
+                );
+            }
+
+            int[] offsets =
+                    new int[stringCount];
+
+            int offsetBase =
+                    offset + headerSize;
+
+            long offsetsEnd =
+                    (long) offsetBase +
+                            (long) stringCount * 4L;
+
+            if (offsetsEnd > offset + chunkSize ||
+                    offsetsEnd > data.length) {
+                throw new IllegalArgumentException(
+                        "String pool offsets exceed chunk"
+                );
+            }
+
+            for (int i = 0; i < stringCount; i++) {
+                offsets[i] =
+                        readU32Checked(
+                                data,
+                                offsetBase + i * 4
+                        );
+            }
+
+            return new StringPool(
+                    offset,
+                    chunkSize,
+                    stringCount,
+                    flags,
+                    stringsStart,
+                    offsets
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Binary helpers
+    // -------------------------------------------------------------------------
+
+    private static int readU16(
+            byte[] data,
+            int offset
+    ) {
+        checkRange(
+                offset,
+                2,
+                data.length,
+                "u16"
+        );
+
+        return
+                (data[offset] & 0xff) |
+                        ((data[offset + 1] & 0xff) << 8);
+    }
+
+    private static int readU32Checked(
+            byte[] data,
+            int offset
+    ) {
+        checkRange(
+                offset,
+                4,
+                data.length,
+                "u32"
+        );
+
+        return
+                (data[offset] & 0xff) |
+                        ((data[offset + 1] & 0xff) << 8) |
+                        ((data[offset + 2] & 0xff) << 16) |
+                        ((data[offset + 3] & 0xff) << 24);
+    }
+
+    private static void writeU16(
+            byte[] data,
+            int offset,
+            int value
+    ) {
+        checkRange(
+                offset,
+                2,
+                data.length,
+                "u16 write"
+        );
+
+        data[offset] = (byte) value;
+        data[offset + 1] = (byte) (value >>> 8);
+    }
+
+    private static void writeU32(
+            byte[] data,
+            int offset,
+            int value
+    ) {
+        checkRange(
+                offset,
+                4,
+                data.length,
+                "u32 write"
+        );
+
+        data[offset] = (byte) value;
+        data[offset + 1] = (byte) (value >>> 8);
+        data[offset + 2] = (byte) (value >>> 16);
+        data[offset + 3] = (byte) (value >>> 24);
+    }
+
+    private static void checkRange(
+            int offset,
+            int length,
+            int total,
+            String what
+    ) {
+        if (offset < 0 ||
+                length < 0 ||
+                (long) offset + length > total) {
+
+            throw new IllegalArgumentException(
+                    "Invalid " + what +
+                            " range: offset=" +
+                            offset +
+                            " length=" +
+                            length +
+                            " total=" +
+                            total
+            );
+        }
+    }
+
+    private static byte[] readAll(
+            InputStream input
+    ) throws IOException {
+        ByteArrayOutputStream out =
+                new ByteArrayOutputStream();
+
+        byte[] buffer = new byte[64 * 1024];
+
+        int n;
+
+        while ((n = input.read(buffer)) != -1) {
+            out.write(buffer, 0, n);
+        }
+
+        return out.toByteArray();
+    }
+
+    private static void log(
+            Progress progress,
+            String message
+    ) {
+        if (progress != null) {
+            progress.log(message);
+        }
     }
 }
