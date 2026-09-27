@@ -15,7 +15,9 @@ import androidx.compose.ui.*
 import androidx.compose.ui.graphics.*
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.*
+import androidx.activity.ComponentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
@@ -55,7 +57,7 @@ private fun catColor(cat: String) = when (cat) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PatchScreen(pkg: String, navController: NavController, vm: PatchViewModel = viewModel()) {
+fun PatchScreen(pkg: String, navController: NavController, vm: PatchViewModel = viewModel(LocalContext.current as ComponentActivity)) {
     val state by vm.state.collectAsStateWithLifecycle()
 
     LaunchedEffect(pkg) {
