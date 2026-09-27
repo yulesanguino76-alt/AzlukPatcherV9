@@ -18,7 +18,9 @@ import androidx.compose.ui.*
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.*
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.*
+import androidx.activity.ComponentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
@@ -30,7 +32,7 @@ import java.io.FileInputStream
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PatchLogScreen(pkg: String, navController: NavController, vm: PatchViewModel = viewModel()) {
+fun PatchLogScreen(pkg: String, navController: NavController, vm: PatchViewModel = viewModel(LocalContext.current as ComponentActivity)) {
     val state   by vm.state.collectAsStateWithLifecycle()
     val ctx      = LocalContext.current
     val logState = rememberLazyListState()
