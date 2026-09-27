@@ -1,0 +1,71 @@
+name: Build AzlukPatcher
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # Descargar el repositorio
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Instalar Java 17
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # Configurar Android SDK
+      #
+      # packages: '' evita que setup-android intente
+      # instalar el paquete antiguo "tools".
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+
+      # Instalar únicamente los componentes necesarios
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+      # Configurar Gradle
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.2'
+
+      # Compilar APK Debug — las variables de entorno son leídas directamente
+      # por build.gradle vía System.getenv(), inyectando BuildConfig.TOKENROUTER_*.
+      # Configura los secrets en: Settings → Secrets and variables → Actions
+      - name: Build Debug APK
+        env:
+          TOKENROUTER_API_KEY: ${{ secrets.TOKENROUTER_API_KEY }}
+          TOKENROUTER_BASE_URL: ${{ secrets.TOKENROUTER_BASE_URL }}
+          TOKENROUTER_MODEL: ${{ secrets.TOKENROUTER_MODEL }}
+        run: |
+          gradle assembleDebug --stacktrace
+
+      # Guardar el APK generado
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AzlukPatcher-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
