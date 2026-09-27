@@ -1,0 +1,46 @@
+{
+  "packs": [
+    {
+      "id": "lucky_core",
+      "name": "Lucky Core Pack",
+      "icon": "verified_user",
+      "category": "bypass",
+      "description": "License bypass + IAP bypass + Signature spoof. The classic LuckyPatcher combo."
+    },
+    {
+      "id": "np_ssl",
+      "name": "NPManager SSL Pack",
+      "icon": "lock_open",
+      "category": "security",
+      "description": "SSL unpinning suite — OkHttp, TrustManager, X509. Full network interception unlock."
+    },
+    {
+      "id": "gg_stealth",
+      "name": "GameGuardian Stealth",
+      "icon": "shield",
+      "category": "security",
+      "description": "Root + SafetyNet + Frida bypass combo. Makes your device look clean to any detection."
+    },
+    {
+      "id": "ads_nuke",
+      "name": "Ads Nuke",
+      "icon": "block",
+      "category": "ads",
+      "description": "Kills AdMob, Facebook Audience, Unity, AppLovin, IronSource, MoPub, Chartboost in one shot."
+    },
+    {
+      "id": "dev_tools",
+      "name": "Developer Unlock",
+      "icon": "code",
+      "category": "dev",
+      "description": "Force debuggable + Disable FLAG_SECURE + Export all components. Full dev access."
+    },
+    {
+      "id": "full_patch",
+      "name": "Full AzlukPatch",
+      "icon": "auto_fix_high",
+      "category": "all",
+      "description": "Everything enabled. License + IAP + Ads + SSL + Root + SafetyNet + Frida bypass."
+    }
+  ]
+}

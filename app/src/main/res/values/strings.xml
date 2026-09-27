@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AzlukPatcher</string>
+    <string name="channel_id">azluk_patch_channel</string>
+    <string name="channel_name">Patching</string>
+    <string name="notif_title">AzlukPatcher</string>
+    <string name="notif_patching">Patching in background…</string>
+    <string name="notif_done">Patch complete</string>
+    <string name="notif_failed">Patch failed</string>
+</resources>
