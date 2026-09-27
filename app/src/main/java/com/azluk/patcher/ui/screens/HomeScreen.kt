@@ -128,33 +128,45 @@ private fun AzlukHeader(
                 verticalAlignment     = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                // LEFT — logo + name (back to left-aligned as in original)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(contentAlignment = Alignment.Center) {
+                // LEFT — logo + name, both vertically centered on the same axis
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier          = Modifier.height(56.dp)
+                ) {
+                    Box(
+                        modifier         = Modifier.size(56.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
                         Box(
                             Modifier.size(56.dp)
                                 .background(Brush.radialGradient(listOf(AzlukBlue.copy(.28f), Color.Transparent)), CircleShape)
                         )
-                        // Transparent logo — no .clip() = no black background
+                        // Transparent logo — full continuous 360° spin, no .clip() = no black background
                         Image(
                             painter            = painterResource(R.drawable.azluk_logo_transparent),
                             contentDescription = "AzlukPatcher",
-                            modifier           = Modifier.size(52.dp).rotate(rotation * 0.2f)
+                            modifier           = Modifier.size(52.dp).rotate(rotation)
                         )
                     }
                     Spacer(Modifier.width(10.dp))
-                    // Name only — no "V8", no "by Azluk"
+                    // Name — vertically centered against the 56dp logo box, tight line-height
+                    // so its visual center matches the icon's center instead of sitting higher
                     Text(
                         "AzlukPatcher",
                         color         = AzlukOnBg,
                         fontSize      = 20.sp,
+                        lineHeight    = 20.sp,
                         fontWeight    = FontWeight.ExtraBold,
-                        letterSpacing = (-0.5).sp
+                        letterSpacing = (-0.5).sp,
+                        modifier      = Modifier.align(Alignment.CenterVertically)
                     )
                 }
 
-                // RIGHT — Files + Refresh (no Tools)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                // RIGHT — Files + Refresh, inset from the true edge (not pinned to the corner)
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier              = Modifier.padding(end = 6.dp)
+                ) {
                     HeaderBtn(Icons.Default.FolderOpen, "Files",   AzlukWarning) { navController.navigate("patched") }
                     HeaderBtn(Icons.Default.Refresh,    "Refresh", AzlukBlue)    { vm.refresh() }
                 }
@@ -371,4 +383,4 @@ fun rememberDrawablePainter(drawable: Drawable): androidx.compose.ui.graphics.pa
             }
         }
     }
-    
+}
