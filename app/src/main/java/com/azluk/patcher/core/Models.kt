@@ -17,9 +17,8 @@ data class AppInfo(
 enum class PatchStatus { UNKNOWN, LIKELY, PATCHABLE, COMPLEX }
 
 /**
- * AzlukPatcher V9 Patch Types
- * Absorbed from: LuckyPatcher, ApkEditorPro, NPManager, GameGuardian,
- *                JasiPatcher, MTManager, hack-app-data, cheat-engine
+ * AzlukPatcher Patch Types
+ * Full bypass, ad-removal, anti-detection and developer patch suite.
  */
 enum class PatchType(
     val key:         String,
@@ -40,7 +39,7 @@ enum class PatchType(
     ),
     SIGNATURE_BYPASS(
         "SIGNATURE_BYPASS", "Signature Bypass",
-        "ApkEditorPro technique: hooks PackageInfo.getSignatures() and signingInfo to return original certificate hash after repack.",
+        "Hooks PackageInfo.getSignatures() and signingInfo to return the original certificate hash after repacking.",
         "bypass"
     ),
     GOOGLE_PLAY_BYPASS(
@@ -51,23 +50,23 @@ enum class PatchType(
     // ── ADS ───────────────────────────────────────────────────────────────────
     REMOVE_ADS(
         "REMOVE_ADS", "Remove Ads",
-        "Kills 20+ ad SDKs at DEX level: AdMob, Facebook Audience, Unity, AppLovin, IronSource, MoPub, Chartboost, Vungle, InMobi, Mintegral + LuckyPatcher AdsBlockList (79 patterns).",
+        "Kills 20+ ad SDKs at DEX level: AdMob, Facebook Audience, Unity, AppLovin, IronSource, MoPub, Chartboost, Vungle, InMobi, Mintegral and more.",
         "ads"
     ),
     BLOCK_AD_DOMAINS(
         "BLOCK_AD_DOMAINS", "Block Ad Domains",
-        "Patches OkHttp/Retrofit/Volley network calls to drop requests to ad domains from LuckyPatcher AdsBlockList.",
+        "Patches OkHttp/Retrofit/Volley network calls to drop requests to known ad domains (79-domain blocklist).",
         "ads"
     ),
     // ── SECURITY BYPASS ───────────────────────────────────────────────────────
     SSL_BYPASS(
         "SSL_BYPASS", "SSL Pinning Bypass",
-        "NPManager technique: patches OkHttp CertificatePinner, TrustManager, X509TrustManager and Conscrypt to accept all certificates.",
+        "Patches OkHttp CertificatePinner, TrustManager, X509TrustManager and Conscrypt to accept all certificates.",
         "security"
     ),
     ROOT_BYPASS(
         "ROOT_BYPASS", "Root Detection Bypass",
-        "GameGuardian technique: patches RootBeer, isRooted(), su binary checks, prop file checks, and build tag validation.",
+        "Patches RootBeer, isRooted(), su binary checks, prop file checks, and build tag validation.",
         "security"
     ),
     SAFETYNET_BYPASS(
@@ -77,7 +76,7 @@ enum class PatchType(
     ),
     FRIDA_BYPASS(
         "FRIDA_BYPASS", "Anti-Frida / Anti-Debug",
-        "JasiPatcher technique: removes Frida/Xposed/Substrate detection, patches TracerPid reader, disables ptrace anti-debug.",
+        "Removes Frida/Xposed/Substrate detection, patches the TracerPid reader, disables ptrace anti-debug.",
         "security"
     ),
     EMULATOR_BYPASS(
@@ -93,7 +92,7 @@ enum class PatchType(
     ),
     DISABLE_FLAG_SECURE(
         "DISABLE_FLAG_SECURE", "Disable FLAG_SECURE",
-        "JasiPatcher technique: nops Window.addFlags(FLAG_SECURE) calls. Enables screenshots, screen recording and overlay tools.",
+        "Nops Window.addFlags(FLAG_SECURE) calls. Enables screenshots, screen recording and overlay tools.",
         "dev"
     ),
     EXPORT_ALL_COMPONENTS(
