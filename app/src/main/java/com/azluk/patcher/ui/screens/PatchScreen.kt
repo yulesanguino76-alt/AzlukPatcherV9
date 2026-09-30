@@ -18,6 +18,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.*
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
@@ -60,6 +62,12 @@ private fun catColor(cat: String) = when (cat) {
 fun PatchScreen(pkg: String, navController: NavController, vm: PatchViewModel = viewModel(LocalContext.current as ComponentActivity)) {
     val state by vm.state.collectAsStateWithLifecycle()
 
+    val filePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri ->
+        uri?.let { vm.importAndScan(it) }
+    }
+
     LaunchedEffect(pkg) {
         vm.ensureScanned(pkg)
     }
@@ -89,13 +97,28 @@ fun PatchScreen(pkg: String, navController: NavController, vm: PatchViewModel = 
             TopAppBar(
                 title = {
                     Column {
-                        Text("Select Patches", color = AzlukOnBg, fontWeight = FontWeight.SemiBold)
-                        Text(pkg, color = AzlukOnSurface, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            state.scannedFileName ?: "Select Patches",
+                            color = AzlukOnBg, fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            state.scannedFileName ?: pkg,
+                            color = AzlukOnSurface, fontSize = 10.sp,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis
+                        )
                     }
                 },
                 navigationIcon = {
                     IconButton(onClick = { navController.popBackStack() }) {
                         Icon(Icons.Default.ArrowBack, null, tint = AzlukOnSurface)
+                    }
+                },
+                actions = {
+                    IconButton(
+                        onClick = { filePicker.launch("*/*") },
+                        enabled = !state.isScanning
+                    ) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = "Import APK/XAPK", tint = AzlukBlue)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = AzlukSurface)
@@ -118,7 +141,7 @@ fun PatchScreen(pkg: String, navController: NavController, vm: PatchViewModel = 
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(
                             onClick  = { vm.scan(pkg) },
-                            enabled  = !state.isScanning,
+                            enabled  = !state.isScanning && state.scannedFile == null,
                             modifier = Modifier.weight(1f),
                             shape    = RoundedCornerShape(12.dp),
                             border   = BorderStroke(1.dp, AzlukSurfaceVar)
@@ -132,7 +155,7 @@ fun PatchScreen(pkg: String, navController: NavController, vm: PatchViewModel = 
                             Text("Scan", color = AzlukBlue, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                         }
                         Button(
-                            onClick  = { vm.resetPatch(); navController.navigate("patchlog/$pkg") },
+                            onClick  = { vm.resetPatch(); vm.patchActiveSource(pkg); navController.navigate("patchlog/$pkg") },
                             enabled  = state.selectedPatches.isNotEmpty() && !state.isScanning,
                             modifier = Modifier.weight(2f),
                             shape    = RoundedCornerShape(12.dp),
@@ -152,6 +175,27 @@ fun PatchScreen(pkg: String, navController: NavController, vm: PatchViewModel = 
             contentPadding       = PaddingValues(16.dp),
             verticalArrangement  = Arrangement.spacedBy(10.dp)
         ) {
+            state.scannedFileName?.let { fileName ->
+                item {
+                    Surface(color = AzlukWarning.copy(.08f), shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.dp, AzlukWarning.copy(.25f))) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.FolderZip, null, tint = AzlukWarning, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Column {
+                                Text("Imported file", color = AzlukWarning,
+                                    fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                                Text(fileName, color = AzlukOnSurface, fontSize = 11.sp,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                }
+            }
+
             if (detectedTypes.isNotEmpty()) {
                 item {
                     Surface(color = AzlukBlue.copy(.08f), shape = RoundedCornerShape(14.dp),
