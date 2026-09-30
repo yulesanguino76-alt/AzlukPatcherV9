@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.HashSet
+import java.util.LinkedHashMap
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -246,6 +247,114 @@ class ApkEngine(
     }
 
     // -------------------------------------------------------------------------
+    // External scanning (APK / XAPK / APKM / APKS)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Routes an external file to the right scanner.
+     */
+    fun scanExternal(
+        input: File
+    ): List<ScanResult> {
+        require(input.exists()) {
+            "Input file does not exist: ${input.absolutePath}"
+        }
+
+        return when (input.extension.lowercase()) {
+            "apk" -> scanFile(input)
+
+            "xapk",
+            "apkm",
+            "apks" -> scanContainer(input)
+
+            else -> throw IllegalArgumentException(
+                "Unsupported input type: .${input.extension}"
+            )
+        }
+    }
+
+    /**
+     * Scans a split-APK container without extracting it.
+     *
+     * Each inner .apk is copied bounded to a temp file, scanned with the
+     * normal scanFile path (DEX recipes + manifest attributes), and
+     * deleted. Keys are unioned across splits — a patch found in ANY
+     * split is offered once for the whole container, mirroring how
+     * patchContainer patches every split.
+     *
+     * Non-APK members (toc.pb, manifest.json, icon.png, OBBs) are drained,
+     * never materialized.
+     */
+    fun scanContainer(
+        input: File
+    ): List<ScanResult> {
+        val union =
+            LinkedHashMap<String, ScanResult>()
+
+        var apkCount = 0
+
+        ZipInputStream(
+            BufferedInputStream(
+                FileInputStream(input),
+                BUFFER_SIZE
+            )
+        ).use { zip ->
+
+            while (true) {
+                val entry =
+                    zip.nextEntry ?: break
+
+                val name =
+                    entry.name
+
+                if (!entry.isDirectory &&
+                    name.endsWith(".apk", true)
+                ) {
+                    apkCount++
+
+                    val tmp = File(
+                        ctx.cacheDir,
+                        "azluk-scan-${System.nanoTime()}.apk"
+                    )
+
+                    try {
+                        copyZipEntryToFile(
+                            zip,
+                            tmp
+                        )
+
+                        for (r in scanFile(tmp)) {
+                            union.putIfAbsent(
+                                r.patchType,
+                                r
+                            )
+                        }
+                    } finally {
+                        tmp.delete()
+                    }
+                } else {
+                    drain(zip)
+                }
+
+                zip.closeEntry()
+            }
+        }
+
+        if (apkCount == 0) {
+            throw IOException(
+                "Container contains no APK files"
+            )
+        }
+
+        return union.values.toList() + ScanResult(
+            "OPTIMIZE_ZIP",
+            "Repack-level optimization, always available",
+            -1,
+            0
+        )
+    }
+
+    // -------------------------------------------------------------------------
     // APK patching
     // -------------------------------------------------------------------------
 
@@ -374,10 +483,6 @@ class ApkEngine(
                         "(${formatSize(output.length())})"
             )
         } finally {
-            /*
-             * Executor cleanup and temporary files are both handled here,
-             * regardless of success/failure.
-             */
             workRoot.deleteRecursively()
         }
     }
@@ -809,12 +914,6 @@ class ApkEngine(
         uncompressedSize: Long,
         nameSize: Int
     ): Long {
-        /*
-         * Alignment is only applied to STORED entries, so exact compressed
-         * offsets are not needed for later alignment decisions.
-         *
-         * We conservatively leave offset tracking monotonic.
-         */
         return current +
                 30L +
                 nameSize +
@@ -830,23 +929,6 @@ class ApkEngine(
             return null
         }
 
-        /*
-         * Local file header:
-         *
-         * signature 4
-         * version 2
-         * flags 2
-         * method 2
-         * time 2
-         * date 2
-         * crc 4
-         * compressed size 4
-         * size 4
-         * name length 2
-         * extra length 2
-         *
-         * = 30 bytes
-         */
         val base =
             currentOffset +
                     30L +
@@ -861,11 +943,6 @@ class ApkEngine(
             return null
         }
 
-        /*
-         * Extra fields themselves need at least four bytes:
-         *   header-id u16
-         *   data-size u16
-         */
         if (extraLength < 4) {
             extraLength += alignment
         }
@@ -882,9 +959,6 @@ class ApkEngine(
         val extra =
             ByteArray(extraLength)
 
-        /*
-         * Private padding field ID.
-         */
         extra[0] = 0x99.toByte()
         extra[1] = 0x99.toByte()
 
@@ -917,10 +991,6 @@ class ApkEngine(
                 ignoreCase = true
             )
         ) {
-            /*
-             * 16 KiB alignment is compatible with the 16K-page Android
-             * direction and is also a valid multiple for current devices.
-             */
             16 * 1024
         } else {
             4
@@ -928,7 +998,7 @@ class ApkEngine(
     }
 
     // -------------------------------------------------------------------------
-    // XAPK/APKM/APKS
+    // XAPK/APKM/APKS patching
     // -------------------------------------------------------------------------
 
     private fun patchContainer(
@@ -946,12 +1016,12 @@ class ApkEngine(
         val extracted =
             File(root, "extracted")
 
-        val patched =
+        val patchedDir =
             File(root, "patched")
 
         root.mkdirs()
         extracted.mkdirs()
-        patched.mkdirs()
+        patchedDir.mkdirs()
 
         try {
             emit(
@@ -980,11 +1050,11 @@ class ApkEngine(
             }
 
             for (apk in apkFiles) {
+                val relativePath =
+                    apk.relativeTo(extracted)
+
                 val destination =
-                    File(
-                        patched,
-                        apk.relativeTo(extracted)
-                    )
+                    File(patchedDir, relativePath)
 
                 destination.parentFile?.mkdirs()
 
@@ -1010,11 +1080,11 @@ class ApkEngine(
                 }
 
             for (file in unchanged) {
+                val relativePath =
+                    file.relativeTo(extracted)
+
                 val destination =
-                    File(
-                        patched,
-                        file.relativeTo(extracted)
-                    )
+                    File(patchedDir, relativePath)
 
                 destination.parentFile?.mkdirs()
 
@@ -1026,7 +1096,7 @@ class ApkEngine(
             }
 
             repackContainer(
-                patched,
+                patchedDir,
                 output
             )
 
