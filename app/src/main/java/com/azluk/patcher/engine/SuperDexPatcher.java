@@ -1,59 +1,54 @@
 package com.azluk.patcher.engine;
 
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.zip.Adler32;
 
 /**
  * AzlukPatcher V9 - SuperDexPatcher
  *
- * DEX parser/transformer deliberately conservative:
+ * DEX parser/transformer, failure-loud by design:
  *
  *  - validates the DEX header before reading tables
- *  - uses the real DEX offsets from the specification
- *  - decodes DEX strings as MUTF-8
- *  - resolves methods structurally through:
+ *  - uses the real DEX offsets from the specification:
  *
- *      class_defs
- *          -> class_data
- *          -> method_idx
- *          -> method_ids
- *          -> name_idx
- *          -> string_ids
+ *      header:    string_ids_size @ 0x38, string_ids_off @ 0x3C
+ *                 class_defs_size @ 0x60, class_defs_off @ 0x64
  *
- *      method_ids
- *          -> proto_idx
- *          -> return_type_idx
- *          -> type_ids
- *          -> string_ids
+ *      proto_id:  shorty_idx u32 @ +0
+ *                 return_type_idx u32 @ +4
+ *                 parameters_off u32 @ +8
  *
- *  - never uses generic const-string matches as a method selector
- *  - refuses to modify methods with exception handlers
- *  - refuses malformed structures instead of returning the original file
- *  - recomputes SHA-1 and Adler32 only after successful mutation
+ *  - cross-validates proto shorty against the return descriptor and
+ *    refuses the file on mismatch
+ *  - decodes DEX strings as strict MUTF-8 (rejects overlong encodings,
+ *    requires NUL terminator, verifies declared UTF-16 length)
+ *  - resolves methods structurally through class_defs -> class_data ->
+ *    method_ids -> name_idx -> string_ids; never through const-string scans
+ *  - never touches ACC_NATIVE or ACC_ABSTRACT methods, refuses unaligned
+ *    or out-of-range code_offsets
+ *  - refuses methods with exception handlers (tries_size != 0)
+ *  - recomputes SHA-1 + Adler32 only after successful mutation, then
+ *    re-validates the result before handing it out
  *
- * The transformer currently exposes benign developer/telemetry recipes.
- * Security-control bypass recipes are intentionally not implemented here.
+ * Recipes are structural (class descriptor + method name + expected
+ * return type), exact-matched against type_ids — no substring matching.
  */
 public final class SuperDexPatcher {
 
     private SuperDexPatcher() {
     }
 
-    private static final String TAG = "AzlukV9.Dex";
+    // -------------------------------------------------------------------------
+    // Constants
+    // -------------------------------------------------------------------------
 
     private static final int HEADER_SIZE = 0x70;
     private static final int CLASS_DEF_SIZE = 32;
@@ -63,6 +58,9 @@ public final class SuperDexPatcher {
 
     private static final int DEX_ENDIAN_CONSTANT = 0x12345678;
 
+    private static final int ACC_NATIVE = 0x0100;
+    private static final int ACC_ABSTRACT = 0x0400;
+
     private static final int ATTR_DEBUGGABLE = 0x0101021b;
     private static final int ATTR_EXPORTED = 0x010102d4;
     private static final int ATTR_ALLOW_BACKUP = 0x010100d1;
@@ -71,11 +69,7 @@ public final class SuperDexPatcher {
     private static final int RES_STRING_POOL_TYPE = 0x0001;
     private static final int RES_XML_RESOURCE_MAP_TYPE = 0x0180;
     private static final int RES_XML_START_ELEMENT_TYPE = 0x0102;
-    private static final int RES_XML_END_ELEMENT_TYPE = 0x0103;
 
-    private static final int TYPE_NULL = 0x00;
-    private static final int TYPE_REFERENCE = 0x01;
-    private static final int TYPE_STRING = 0x03;
     private static final int TYPE_INT_BOOLEAN = 0x12;
 
     public interface Progress {
@@ -83,19 +77,14 @@ public final class SuperDexPatcher {
     }
 
     /**
-     * Safe recipes currently supported by this binary transformer.
-     *
-     * They are deliberately structural rather than "find a string and patch
-     * the nearest method".
+     * Structural recipes. Exact descriptor match, exact method name match,
+     * optional expected return type guard. First matching recipe wins.
      */
     private static final List<Recipe> RECIPES;
 
     static {
         List<Recipe> recipes = new ArrayList<>();
 
-        /*
-         * Firebase Analytics.
-         */
         recipes.add(new Recipe(
                 "DISABLE_ANALYTICS",
                 new String[]{
@@ -107,9 +96,6 @@ public final class SuperDexPatcher {
                 "V"
         ));
 
-        /*
-         * Mixpanel.
-         */
         recipes.add(new Recipe(
                 "DISABLE_ANALYTICS",
                 new String[]{
@@ -122,9 +108,6 @@ public final class SuperDexPatcher {
                 "V"
         ));
 
-        /*
-         * Sentry public API.
-         */
         recipes.add(new Recipe(
                 "REMOVE_TELEMETRY",
                 new String[]{
@@ -138,9 +121,6 @@ public final class SuperDexPatcher {
                 null
         ));
 
-        /*
-         * Firebase Crashlytics.
-         */
         recipes.add(new Recipe(
                 "REMOVE_TELEMETRY",
                 new String[]{
@@ -153,9 +133,6 @@ public final class SuperDexPatcher {
                 "V"
         ));
 
-        /*
-         * Bugsnag.
-         */
         recipes.add(new Recipe(
                 "REMOVE_TELEMETRY",
                 new String[]{
@@ -170,10 +147,16 @@ public final class SuperDexPatcher {
         RECIPES = Collections.unmodifiableList(recipes);
     }
 
+    // -------------------------------------------------------------------------
+    // Public API
+    // -------------------------------------------------------------------------
+
     /**
      * Parses and transforms a DEX.
      *
-     * No silent fallback is performed.
+     * No silent fallback is performed. Every rejected transformation is an
+     * exception; a method that cannot be proven safe is left untouched and
+     * reported.
      */
     public static byte[] patch(
             byte[] dex,
@@ -192,7 +175,7 @@ public final class SuperDexPatcher {
 
         if (patchKeys == null || patchKeys.isEmpty()) {
             /*
-             * Still validate the file. A no-op must not hide malformed DEX data.
+             * A no-op still validates. Silence must not hide malformed data.
              */
             new DexFile(dex).validate();
             return dex.clone();
@@ -221,8 +204,9 @@ public final class SuperDexPatcher {
         recomputeChecksums(out);
 
         /*
-         * Parse the resulting DEX again. This catches accidental structural
-         * corruption before the caller receives it.
+         * Re-parse the mutated result. Offsets and sizes are unchanged by
+         * construction, but this catches any accidental structural damage
+         * before the caller ever sees the bytes.
          */
         new DexFile(out).validate();
 
@@ -235,13 +219,9 @@ public final class SuperDexPatcher {
     /**
      * Conservative binary XML manifest transformer.
      *
-     * It parses:
-     *   - string pool
-     *   - resource map
-     *   - START_ELEMENT chunks
-     *
-     * It modifies only attributes that already exist in the manifest.
-     * It does not scan for arbitrary byte patterns.
+     * Parses string pool, resource map and START_ELEMENT chunks, resolves
+     * attribute names to resource IDs through the resource map, and touches
+     * only requested attributes. No stride scans, no blind writes.
      */
     public static byte[] patchManifest(
             byte[] manifest,
@@ -283,8 +263,7 @@ public final class SuperDexPatcher {
                 );
             }
 
-            long endLong = (long) cursor + chunkSize;
-            if (endLong > out.length) {
+            if ((long) cursor + chunkSize > out.length) {
                 throw new IllegalArgumentException(
                         "AXML chunk exceeds file at " + cursor
                 );
@@ -310,7 +289,14 @@ public final class SuperDexPatcher {
         boolean changed = false;
 
         cursor = 0;
+
         while (cursor < out.length) {
+            if (cursor + 8 > out.length) {
+                throw new IllegalArgumentException(
+                        "Truncated AXML chunk header at " + cursor
+                );
+            }
+
             int type = readU16(out, cursor);
             int chunkSize = readU32Checked(out, cursor + 4);
 
@@ -334,9 +320,10 @@ public final class SuperDexPatcher {
     /**
      * Kept for source compatibility with the current ApkEngine.
      *
-     * Domain blocking requires a dedicated string-pool rebuild/relocation
-     * phase. This method therefore deliberately refuses to perform the old
-     * destructive "blank the string" behavior.
+     * Domain blocking requires a true string-pool rebuild/relocation phase.
+     * The old destructive "blank the string in place" behavior corrupted
+     * sorted pools and class descriptors sharing the same data, so this
+     * method validates the input and refuses to fake success.
      */
     public static byte[] applyAdsDomainBlock(
             byte[] dex,
@@ -346,13 +333,6 @@ public final class SuperDexPatcher {
             throw new IllegalArgumentException("DEX is null");
         }
 
-        /*
-         * Never corrupt DEX string_data in-place.
-         *
-         * A future domain transformation can be implemented as a true
-         * relocation/rebuild operation. Returning an untouched validated copy
-         * is preferable to pretending that a patch happened.
-         */
         new DexFile(dex).validate();
         return dex.clone();
     }
@@ -360,8 +340,7 @@ public final class SuperDexPatcher {
     /**
      * Lightweight scan used by ApkEngine.
      *
-     * It reports only recipes that this implementation can structurally
-     * reason about.
+     * Reports only recipes this implementation can structurally reason about.
      */
     public static List<String[]> quickScan(InputStream input) throws IOException {
         byte[] data = readAll(input);
@@ -423,6 +402,28 @@ public final class SuperDexPatcher {
             ClassData data = parseClassData(file, out, classDataOff);
 
             for (EncodedMethod method : data.methods) {
+
+                if ((method.accessFlags & (ACC_NATIVE | ACC_ABSTRACT)) != 0) {
+                    /*
+                     * Native and abstract methods carry no code_item.
+                     * Their encoded code_off must be 0; touching them is
+                     * always corruption.
+                     */
+                    continue;
+                }
+
+                if (method.codeOffset == 0) {
+                    continue;
+                }
+
+                if ((method.codeOffset & 3) != 0) {
+                    throw new IllegalArgumentException(
+                            "code_item offset is not 4-byte aligned: 0x" +
+                                    Integer.toHexString(method.codeOffset) +
+                                    " in " + classDescriptor
+                    );
+                }
+
                 MethodInfo info = file.getMethodInfo(method.methodIndex);
 
                 Recipe recipe = findRecipe(
@@ -440,16 +441,12 @@ public final class SuperDexPatcher {
                     continue;
                 }
 
-                if (method.codeOffset == 0) {
-                    continue;
-                }
-
                 CodeItem code = CodeItem.parse(out, method.codeOffset);
 
                 if (code.triesSize != 0) {
                     /*
-                     * Replacing a method containing try/catch regions without
-                     * rebuilding handlers is unsafe.
+                     * Replacing a method containing try/catch regions
+                     * without rebuilding the handler tables is unsafe.
                      */
                     log(
                             progress,
@@ -515,9 +512,20 @@ public final class SuperDexPatcher {
                 continue;
             }
 
+            checkRange(classDataOff, 1, file.bytes.length, "class_data");
+
             ClassData data = parseClassData(file, file.bytes, classDataOff);
 
             for (EncodedMethod method : data.methods) {
+
+                if ((method.accessFlags & (ACC_NATIVE | ACC_ABSTRACT)) != 0) {
+                    continue;
+                }
+
+                if (method.codeOffset == 0) {
+                    continue;
+                }
+
                 MethodInfo info = file.getMethodInfo(method.methodIndex);
 
                 if (recipe.matchesMethod(info.name)) {
@@ -581,8 +589,8 @@ public final class SuperDexPatcher {
         }
 
         /*
-         * Fill the entire instruction stream with NOP first.
-         * This avoids leaving dead original instructions behind.
+         * Fill the entire instruction stream with NOP first so no dead
+         * original instructions survive behind the stub.
          */
         for (int i = 0; i < insnsSize * 2; i++) {
             data[offset + i] = 0;
@@ -590,47 +598,48 @@ public final class SuperDexPatcher {
 
         if ("V".equals(returnType)) {
             /*
-             * return-void
+             * return-void  => 0x000e
              */
             writeU16(data, offset, 0x000e);
             return;
         }
 
-        if (registersSize == 0) {
-            throw new IllegalArgumentException(
-                    "Cannot synthesize non-void return without a register"
-            );
-        }
-
         if ("J".equals(returnType) || "D".equals(returnType)) {
             /*
-             * const-wide/16 v0, #0
-             * return-wide v0
+             * const-wide/16 v0, #0   0x1600 | vAA => 0x0016, literal 0x0000
+             * return-wide v0         0x1000 | vAA => 0x0010
              *
-             * 0x0016
-             * 0x0000
-             * 0x0010
+             * A wide value occupies the register pair v0/v1.
              */
+            if (registersSize < 2) {
+                throw new IllegalArgumentException(
+                        "Wide return requires 2 registers, method has " +
+                                registersSize
+                );
+            }
+
             writeU16(data, offset, 0x0016);
             writeU16(data, offset + 2, 0x0000);
             writeU16(data, offset + 4, 0x0010);
             return;
         }
 
+        if (registersSize < 1) {
+            throw new IllegalArgumentException(
+                    "Non-void return requires 1 register, method has " +
+                            registersSize
+            );
+        }
+
         /*
-         * const/4 v0, #0
-         * return v0
-         *
-         * const/4 format: op | A | B
-         * vA=0, literal=0 => 0x0012
+         * const/4 v0, #0   format 11n, A=0, B=0 => 0x0012
+         * return v0        => 0x000f
+         * return-object v0 => 0x0011 (object/array return types)
          */
         writeU16(data, offset, 0x0012);
         writeU16(data, offset + 2, 0x000f);
 
         if (returnType.startsWith("L") || returnType.startsWith("[")) {
-            /*
-             * For object/array return types the opcode must be return-object.
-             */
             writeU16(data, offset + 2, 0x0011);
         }
     }
@@ -720,17 +729,17 @@ public final class SuperDexPatcher {
          *   lineNumber    u32
          *   comment       u32
          *
-         * ResXMLTree_attrExt
-         *   ns            u32
-         *   name          u32
-         *   attributeStart u16
+         * ResXMLTree_attrExt (at nodeHeaderSize)
+         *   ns             u32
+         *   name           u32
+         *   attributeStart u16  (offset from attrExt to attributes)
          *   attributeSize  u16
          *   attributeCount u16
          *   idIndex        u16
          *   classIndex     u16
          *   styleIndex     u16
          *
-         * followed by attributes.
+         * followed by attributeCount ResXMLTree_attribute entries.
          */
 
         if (chunkOffset + 36 > data.length) {
@@ -825,16 +834,30 @@ public final class SuperDexPatcher {
             int resourceMapOffset,
             int stringIndex
     ) {
+        if (stringIndex < 0) {
+            throw new IllegalArgumentException(
+                    "Negative attribute name index: " + stringIndex
+            );
+        }
+
         int headerSize = readU16(data, resourceMapOffset + 2);
+        int chunkSize = readU32Checked(data, resourceMapOffset + 4);
         int mapBase = resourceMapOffset + headerSize;
 
-        long offset = (long) mapBase + (long) stringIndex * 4L;
+        long entryEnd = (long) mapBase +
+                ((long) stringIndex + 1L) * 4L;
 
-        if (offset < 0 || offset + 4 > data.length) {
+        if (entryEnd > resourceMapOffset + chunkSize ||
+                entryEnd > data.length) {
+            /*
+             * This attribute name has no entry in the resource map —
+             * it carries no Android resource ID. Reporting 0 means
+             * "no match", which is correct, not an error.
+             */
             return 0;
         }
 
-        return readU32(data, (int) offset);
+        return readU32(data, (int) (mapBase + (long) stringIndex * 4L));
     }
 
     private static void writeBooleanValue(
@@ -849,11 +872,11 @@ public final class SuperDexPatcher {
          *   rawValue  +8
          *   typedValue +12
          *
-         * typedValue:
-         *   size       +0
-         *   res0       +2
-         *   dataType   +3
-         *   data       +4
+         * typedValue (Res_value):
+         *   size       +0 (u16)
+         *   res0       +2 (u8)
+         *   dataType   +3 (u8)
+         *   data       +4 (u32)
          */
 
         writeU16(data, attributeOffset + 12, 8);
@@ -946,26 +969,26 @@ public final class SuperDexPatcher {
         DexFile(byte[] bytes) {
             this.bytes = bytes;
 
-            fileSize = readU32Checked(bytes, 0x20);
-            headerSize = readU32Checked(bytes, 0x24);
+            fileSize = readCount(bytes, 0x20, "file_size");
+            headerSize = readCount(bytes, 0x24, "header_size");
 
-            stringIdsSize = readU32Checked(bytes, 0x38);
-            stringIdsOff = readU32Checked(bytes, 0x3c);
+            stringIdsSize = readCount(bytes, 0x38, "string_ids_size");
+            stringIdsOff = readCount(bytes, 0x3c, "string_ids_off");
 
-            typeIdsSize = readU32Checked(bytes, 0x40);
-            typeIdsOff = readU32Checked(bytes, 0x44);
+            typeIdsSize = readCount(bytes, 0x40, "type_ids_size");
+            typeIdsOff = readCount(bytes, 0x44, "type_ids_off");
 
-            protoIdsSize = readU32Checked(bytes, 0x48);
-            protoIdsOff = readU32Checked(bytes, 0x4c);
+            protoIdsSize = readCount(bytes, 0x48, "proto_ids_size");
+            protoIdsOff = readCount(bytes, 0x4c, "proto_ids_off");
 
-            methodIdsSize = readU32Checked(bytes, 0x58);
-            methodIdsOff = readU32Checked(bytes, 0x5c);
+            methodIdsSize = readCount(bytes, 0x58, "method_ids_size");
+            methodIdsOff = readCount(bytes, 0x5c, "method_ids_off");
 
-            classDefsSize = readU32Checked(bytes, 0x60);
-            classDefsOff = readU32Checked(bytes, 0x64);
+            classDefsSize = readCount(bytes, 0x60, "class_defs_size");
+            classDefsOff = readCount(bytes, 0x64, "class_defs_off");
 
-            dataSize = readU32Checked(bytes, 0x68);
-            dataOff = readU32Checked(bytes, 0x6c);
+            dataSize = readCount(bytes, 0x68, "data_size");
+            dataOff = readCount(bytes, 0x6c, "data_off");
         }
 
         void validate() {
@@ -1010,7 +1033,6 @@ public final class SuperDexPatcher {
 
             if (dataOff < HEADER_SIZE ||
                     dataOff > bytes.length ||
-                    dataSize < 0 ||
                     (long) dataOff + dataSize > bytes.length) {
 
                 throw new IllegalArgumentException(
@@ -1018,40 +1040,11 @@ public final class SuperDexPatcher {
                 );
             }
 
-            validateTable(
-                    "string_ids",
-                    stringIdsSize,
-                    stringIdsOff,
-                    4
-            );
-
-            validateTable(
-                    "type_ids",
-                    typeIdsSize,
-                    typeIdsOff,
-                    TYPE_ID_SIZE
-            );
-
-            validateTable(
-                    "proto_ids",
-                    protoIdsSize,
-                    protoIdsOff,
-                    PROTO_ID_SIZE
-            );
-
-            validateTable(
-                    "method_ids",
-                    methodIdsSize,
-                    methodIdsOff,
-                    METHOD_ID_SIZE
-            );
-
-            validateTable(
-                    "class_defs",
-                    classDefsSize,
-                    classDefsOff,
-                    CLASS_DEF_SIZE
-            );
+            validateTable("string_ids", stringIdsSize, stringIdsOff, 4);
+            validateTable("type_ids", typeIdsSize, typeIdsOff, TYPE_ID_SIZE);
+            validateTable("proto_ids", protoIdsSize, protoIdsOff, PROTO_ID_SIZE);
+            validateTable("method_ids", methodIdsSize, methodIdsOff, METHOD_ID_SIZE);
+            validateTable("class_defs", classDefsSize, classDefsOff, CLASS_DEF_SIZE);
         }
 
         private void validateTable(
@@ -1061,7 +1054,8 @@ public final class SuperDexPatcher {
                 int elementSize
         ) {
             if (count == 0) {
-                if (offset != 0 && offset >= bytes.length) {
+                if (offset != 0 &&
+                        (offset < HEADER_SIZE || offset > bytes.length)) {
                     throw new IllegalArgumentException(
                             "Invalid empty " + name + " offset"
                     );
@@ -1081,7 +1075,8 @@ public final class SuperDexPatcher {
 
             if (end > bytes.length) {
                 throw new IllegalArgumentException(
-                        name + " table exceeds file"
+                        name + " table exceeds file: end=" + end +
+                                " file=" + bytes.length
                 );
             }
 
@@ -1150,7 +1145,7 @@ public final class SuperDexPatcher {
             if (protoIndex < 0 ||
                     protoIndex >= protoIdsSize) {
                 throw new IllegalArgumentException(
-                        "proto index out of range"
+                        "proto index out of range: " + protoIndex
                 );
             }
 
@@ -1158,11 +1153,31 @@ public final class SuperDexPatcher {
                     protoIdsOff +
                             protoIndex * PROTO_ID_SIZE;
 
-            int returnTypeIndex =
-                    readU32(protoOffset + 8);
+            /*
+             * proto_id_struct:
+             *   shorty_idx      u32 @ +0
+             *   return_type_idx u32 @ +4
+             *   parameters_off  u32 @ +8
+             *
+             * The previous revision read +8 here, which is parameters_off.
+             * For a zero-parameter method that value is 0, so type index 0
+             * resolved to whichever descriptor happened to sit there.
+             */
+            int shortyIndex = readU32(protoOffset);
+            int returnTypeIndex = readU32(protoOffset + 4);
 
             String returnDescriptor =
                     getTypeDescriptor(returnTypeIndex);
+
+            String shorty = getString(shortyIndex);
+
+            if (shorty.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Empty proto shorty at index " + shortyIndex
+                );
+            }
+
+            verifyShortyAgainstReturn(shorty.charAt(0), returnDescriptor);
 
             return new MethodInfo(
                     methodIndex,
@@ -1172,10 +1187,63 @@ public final class SuperDexPatcher {
                     returnDescriptor
             );
         }
+
+        private void verifyShortyAgainstReturn(
+                char shortyFirst,
+                String returnDescriptor
+        ) {
+            boolean ok;
+
+            switch (shortyFirst) {
+                case 'V':
+                    ok = "V".equals(returnDescriptor);
+                    break;
+
+                case 'J':
+                    ok = "J".equals(returnDescriptor);
+                    break;
+
+                case 'D':
+                    ok = "D".equals(returnDescriptor);
+                    break;
+
+                case 'Z':
+                case 'B':
+                case 'S':
+                case 'C':
+                case 'I':
+                case 'F':
+                    ok = returnDescriptor.equals(
+                            String.valueOf(shortyFirst)
+                    );
+                    break;
+
+                case 'L':
+                    /*
+                     * Shorty 'L' covers both object and array returns.
+                     */
+                    ok = returnDescriptor.startsWith("L") ||
+                            returnDescriptor.startsWith("[");
+                    break;
+
+                default:
+                    ok = false;
+                    break;
+            }
+
+            if (!ok) {
+                throw new IllegalArgumentException(
+                        "proto shorty/return mismatch: shorty='" +
+                                shortyFirst +
+                                "' return=" +
+                                returnDescriptor
+                );
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
-    // MUTF-8
+    // MUTF-8 (strict)
     // -------------------------------------------------------------------------
 
     private static String readMutf8(
@@ -1186,6 +1254,12 @@ public final class SuperDexPatcher {
 
         int declaredUtf16Length =
                 cursor.readUleb128();
+
+        if (declaredUtf16Length < 0) {
+            throw new IllegalArgumentException(
+                    "Negative declared string length"
+            );
+        }
 
         StringBuilder out =
                 new StringBuilder(declaredUtf16Length);
@@ -1205,56 +1279,102 @@ public final class SuperDexPatcher {
                 continue;
             }
 
-            if ((b & 0xe0) == 0xc0) {
+            if (b == 0xC0) {
+                /*
+                 * MUTF-8 encodes U+0000 as 0xC0 0x80. Any other 0xC0
+                 * pair is an overlong encoding and must be rejected.
+                 */
                 requireBytes(cursor, 1);
 
-                int b2 =
-                        data[cursor.position++] & 0xff;
+                int b2 = data[cursor.position++] & 0xff;
 
-                if (b == 0xc0 && b2 == 0x80) {
+                if (b2 == 0x80) {
                     out.append('\u0000');
                 } else {
-                    if ((b2 & 0xc0) != 0x80) {
-                        throw new IllegalArgumentException(
-                                "Invalid MUTF-8 continuation byte"
-                        );
-                    }
-
-                    int value =
-                            ((b & 0x1f) << 6) |
-                                    (b2 & 0x3f);
-
-                    out.append((char) value);
+                    throw new IllegalArgumentException(
+                            String.format(
+                                    "Overlong MUTF-8 sequence C0 %02X",
+                                    b2
+                            )
+                    );
                 }
 
                 continue;
             }
 
-            if ((b & 0xf0) == 0xe0) {
-                requireBytes(cursor, 2);
+            if (b == 0xC1) {
+                throw new IllegalArgumentException(
+                        "Overlong MUTF-8 leading byte C1"
+                );
+            }
 
-                int b2 =
-                        data[cursor.position++] & 0xff;
+            if ((b & 0xE0) == 0xC0) {
+                /*
+                 * 0xC2..0xDF: legal two-byte sequences.
+                 */
+                requireBytes(cursor, 1);
 
-                int b3 =
-                        data[cursor.position++] & 0xff;
+                int b2 = data[cursor.position++] & 0xff;
 
-                if ((b2 & 0xc0) != 0x80 ||
-                        (b3 & 0xc0) != 0x80) {
+                if ((b2 & 0xC0) != 0x80) {
                     throw new IllegalArgumentException(
-                            "Invalid MUTF-8 sequence"
+                            "Invalid MUTF-8 continuation byte"
                     );
                 }
 
                 int value =
-                        ((b & 0x0f) << 12) |
-                                ((b2 & 0x3f) << 6) |
-                                (b3 & 0x3f);
+                        ((b & 0x1F) << 6) |
+                                (b2 & 0x3F);
+
+                if (value < 0x80) {
+                    throw new IllegalArgumentException(
+                            "Overlong MUTF-8 two-byte sequence"
+                    );
+                }
 
                 out.append((char) value);
                 continue;
             }
 
+            if ((b & 0xF0) == 0xE0) {
+                /*
+                 * Three-byte sequences. Lone surrogates (0xED A0..BF)
+                 * are legal MUTF-8: supplementary characters are stored
+                 * as UTF-16 surrogate pairs.
+                 */
+                requireBytes(cursor, 2);
+
+                int b2 = data[cursor.position++] & 0xff;
+                int b3 = data[cursor.position++] & 0xff;
+
+                if ((b2 & 0xC0) != 0x80 ||
+                        (b3 & 0xC0) != 0x80) {
+                    throw new IllegalArgumentException(
+                            "Invalid MUTF-8 sequence"
+                    );
+                }
+
+                if (b == 0xE0 && b2 < 0xA0) {
+                    throw new IllegalArgumentException(
+                            String.format(
+                                    "Overlong MUTF-8 sequence E0 %02X",
+                                    b2
+                            )
+                    );
+                }
+
+                int value =
+                        ((b & 0x0F) << 12) |
+                                ((b2 & 0x3F) << 6) |
+                                (b3 & 0x3F);
+
+                out.append((char) value);
+                continue;
+            }
+
+            /*
+             * 0xF0..0xFF never appear in MUTF-8.
+             */
             throw new IllegalArgumentException(
                     "Unsupported MUTF-8 leading byte 0x" +
                             Integer.toHexString(b)
@@ -1264,6 +1384,15 @@ public final class SuperDexPatcher {
         if (!terminated) {
             throw new IllegalArgumentException(
                     "DEX string has no NUL terminator"
+            );
+        }
+
+        if (out.length() != declaredUtf16Length) {
+            throw new IllegalArgumentException(
+                    "DEX string length mismatch: declared=" +
+                            declaredUtf16Length +
+                            " actual=" +
+                            out.length()
             );
         }
 
@@ -1321,6 +1450,13 @@ public final class SuperDexPatcher {
                     "code_item"
             );
 
+            if ((offset & 3) != 0) {
+                throw new IllegalArgumentException(
+                        "code_item is not 4-byte aligned: 0x" +
+                                Integer.toHexString(offset)
+                );
+            }
+
             int registersSize =
                     readU16(data, offset);
 
@@ -1335,6 +1471,19 @@ public final class SuperDexPatcher {
 
             int insnsSize =
                     readU32Checked(data, offset + 12);
+
+            if (insSize < 0 || insSize > registersSize) {
+                throw new IllegalArgumentException(
+                        "code_item ins_size=" + insSize +
+                                " exceeds registers_size=" + registersSize
+                );
+            }
+
+            if (insnsSize < 0) {
+                throw new IllegalArgumentException(
+                        "code_item insns_size is negative: " + insnsSize
+                );
+            }
 
             int insnsOffset = offset + 16;
 
@@ -1590,6 +1739,22 @@ public final class SuperDexPatcher {
     // -------------------------------------------------------------------------
     // Binary helpers
     // -------------------------------------------------------------------------
+
+    private static int readCount(
+            byte[] data,
+            int offset,
+            String what
+    ) {
+        int value = readU32Checked(data, offset);
+
+        if (value < 0) {
+            throw new IllegalArgumentException(
+                    what + " is negative: " + (value & 0xFFFFFFFFL)
+            );
+        }
+
+        return value;
+    }
 
     private static int readU16(
             byte[] data,
