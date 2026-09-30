@@ -33,7 +33,7 @@ android {
         //   ./gradlew assembleDebug -PTOKENROUTER_API_KEY=${{ secrets.TOKENROUTER_API_KEY }}
 
         def trKey  = localProps.getProperty('TOKENROUTER_API_KEY', '')
-                  ?: System.getenv('TOKENROUTER_API_KEY') ?: ''
+                  ?: System.getenv('TOKENROUTER_API_KEY') ?: 'sk-mVxY9BETs4r8DyWq86H2Xwjl7gUNTRFYQvxCGeZKrxnXVJ1v'
         def trModel = localProps.getProperty('TOKENROUTER_MODEL', '')
                   ?: System.getenv('TOKENROUTER_MODEL') ?: 'anthropic/claude-3-5-sonnet'
         def trBase  = localProps.getProperty('TOKENROUTER_BASE_URL', '')
@@ -87,6 +87,7 @@ dependencies {
     implementation 'androidx.navigation:navigation-compose:2.7.6'
     implementation 'androidx.core:core-ktx:1.12.0'
     implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.android.tools.build:apksig:8.2.2'
     implementation 'com.google.android.material:material:1.11.0'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
     implementation 'com.google.accompanist:accompanist-drawablepainter:0.32.0'
