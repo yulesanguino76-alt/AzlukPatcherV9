@@ -6,8 +6,10 @@ import java.io.InputStream;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.zip.Adler32;
 
@@ -37,6 +39,12 @@ import java.util.zip.Adler32;
  *  - refuses methods with exception handlers (tries_size != 0)
  *  - recomputes SHA-1 + Adler32 only after successful mutation, then
  *    re-validates the result before handing it out
+ *
+ * Detection:
+ *  - DEX level: exact descriptor presence in type_ids (DETECTORS map)
+ *  - Manifest level: AXML attribute walk resolved through the resource
+ *    map; only reports patches whose attribute exists with a value that
+ *    differs from the patch target
  *
  * Recipes are structural (class descriptor + method name + expected
  * return type), exact-matched against type_ids — no substring matching.
@@ -144,7 +152,97 @@ public final class SuperDexPatcher {
                 null
         ));
 
+        /*
+         * Ad SDK entry points (REMOVE_ADS). All targets are void
+         * load/display methods; ret-void stubs suppress ad loading
+         * and display without touching layout or lifecycle code.
+         */
+        recipes.add(new Recipe("REMOVE_ADS",
+                new String[]{ "Lcom/google/android/gms/ads/AdView;" },
+                new String[]{ "loadAd" }, "V"));
+
+        recipes.add(new Recipe("REMOVE_ADS",
+                new String[]{ "Lcom/google/android/gms/ads/InterstitialAd;",
+                              "Lcom/google/android/gms/ads/AppOpenAd;",
+                              "Lcom/google/android/gms/ads/rewarded/RewardedAd;" },
+                new String[]{ "show" }, "V"));
+
+        recipes.add(new Recipe("REMOVE_ADS",
+                new String[]{ "Lcom/facebook/ads/AdView;", "Lcom/facebook/ads/BannerAdView;" },
+                new String[]{ "loadAd" }, "V"));
+
+        recipes.add(new Recipe("REMOVE_ADS",
+                new String[]{ "Lcom/facebook/ads/InterstitialAd;",
+                              "Lcom/facebook/ads/RewardedVideoAd;",
+                              "Lcom/facebook/ads/RewardedAd;" },
+                new String[]{ "show", "loadAd" }, "V"));
+
+        recipes.add(new Recipe("REMOVE_ADS",
+                new String[]{ "Lcom/unity3d/ads/UnityAds;" },
+                new String[]{ "show", "load" }, "V"));
+
+        recipes.add(new Recipe("REMOVE_ADS",
+                new String[]{ "Lcom/applovin/adview/AppLovinAdView;",
+                              "Lcom/applovin/mediation/ads/MaxInterstitialAd;",
+                              "Lcom/applovin/mediation/ads/MaxAdView;" },
+                new String[]{ "showAd", "show", "loadAd", "load" }, "V"));
+
+        recipes.add(new Recipe("REMOVE_ADS",
+                new String[]{ "Lcom/ironsource/mediationsdk/IronSource;" },
+                new String[]{ "showInterstitial", "showRewardedVideo" }, "V"));
+
+        recipes.add(new Recipe("REMOVE_ADS",
+                new String[]{ "Lcom/mopub/mobileads/MoPubView;",
+                              "Lcom/mopub/mobileads/MoPubInterstitial;" },
+                new String[]{ "loadAd", "show" }, "V"));
+
+        recipes.add(new Recipe("REMOVE_ADS",
+                new String[]{ "Lcom/vungle/warren/Vungle;",
+                              "Lcom/vungle/ads/InterstitialAd;" },
+                new String[]{ "playAd", "show", "load" }, "V"));
+
+        recipes.add(new Recipe("REMOVE_ADS",
+                new String[]{ "Lcom/inmobi/ads/InMobiBanner;",
+                              "Lcom/inmobi/ads/InMobiInterstitial;" },
+                new String[]{ "load", "show" }, "V"));
+
+        recipes.add(new Recipe("REMOVE_ADS",
+                new String[]{ "Lcom/chartboost/sdk/Chartboost;" },
+                new String[]{ "showInterstitial", "showRewardedVideo" }, "V"));
+
         RECIPES = Collections.unmodifiableList(recipes);
+    }
+
+    /**
+     * Exact-descriptor detectors. Presence of an SDK entry-point class in
+     * type_ids marks a patch as APPLICABLE — the transform re-verifies
+     * structurally at patch time, so a stale candidate can never corrupt
+     * anything: it just no-ops with a loud log line.
+     */
+    private static final Map<String, List<String>> DETECTORS;
+
+    static {
+        Map<String, List<String>> detectors = new HashMap<>();
+
+        List<String> ads = new ArrayList<>();
+        List<String> analytics = new ArrayList<>();
+        List<String> telemetry = new ArrayList<>();
+
+        for (Recipe recipe : RECIPES) {
+            if ("REMOVE_ADS".equals(recipe.key)) {
+                Collections.addAll(ads, recipe.classes);
+            } else if ("DISABLE_ANALYTICS".equals(recipe.key)) {
+                Collections.addAll(analytics, recipe.classes);
+            } else if ("REMOVE_TELEMETRY".equals(recipe.key)) {
+                Collections.addAll(telemetry, recipe.classes);
+            }
+        }
+
+        detectors.put("REMOVE_ADS", ads);
+        detectors.put("DISABLE_ANALYTICS", analytics);
+        detectors.put("REMOVE_TELEMETRY", telemetry);
+
+        DETECTORS = Collections.unmodifiableMap(detectors);
     }
 
     // -------------------------------------------------------------------------
@@ -337,34 +435,265 @@ public final class SuperDexPatcher {
         return dex.clone();
     }
 
+    // -------------------------------------------------------------------------
+    // Detection
+    // -------------------------------------------------------------------------
+
     /**
-     * Lightweight scan used by ApkEngine.
-     *
-     * Reports only recipes this implementation can structurally reason about.
+     * DEX-level detection: exact descriptor presence in type_ids.
+     * No substring matching, no byte scans.
      */
-    public static List<String[]> quickScan(InputStream input) throws IOException {
-        byte[] data = readAll(input);
-        DexFile file = new DexFile(data);
+    public static Set<String> scanKeys(byte[] dex) {
+        DexFile file = new DexFile(dex);
         file.validate();
 
-        List<String[]> result = new ArrayList<>();
+        Set<String> descriptors = new HashSet<>();
 
-        Set<String> available = new HashSet<>();
+        for (int i = 0; i < file.typeIdsSize; i++) {
+            descriptors.add(file.getTypeDescriptor(i));
+        }
 
-        for (Recipe recipe : RECIPES) {
-            if (containsRecipeTarget(file, recipe)) {
-                available.add(recipe.key);
+        Set<String> keys = new HashSet<>();
+
+        for (Map.Entry<String, List<String>> entry : DETECTORS.entrySet()) {
+            for (String cls : entry.getValue()) {
+                if (descriptors.contains(cls)) {
+                    keys.add(entry.getKey());
+                    break;
+                }
             }
         }
 
-        for (String key : available) {
+        return keys;
+    }
+
+    public static List<String[]> quickScan(InputStream input) throws IOException {
+        byte[] data = readAll(input);
+
+        List<String[]> result = new ArrayList<>();
+
+        for (String key : scanKeys(data)) {
             result.add(new String[]{
                     key,
-                    "Structural recipe available"
+                    describeKey(key)
             });
         }
 
         return result;
+    }
+
+    private static String describeKey(String key) {
+        switch (key) {
+            case "REMOVE_ADS":
+                return "Ad SDK entry points detected";
+            case "DISABLE_ANALYTICS":
+                return "Analytics SDK detected";
+            case "REMOVE_TELEMETRY":
+                return "Telemetry SDK detected";
+            default:
+                return "Detected";
+        }
+    }
+
+    /**
+     * Manifest-level detection. Only reports a patch when the attribute
+     * EXISTS and its current value differs from the patch target — an
+     * attribute that is absent cannot be rewritten by the current AXML
+     * transformer (it modifies in place, never grows chunks), so
+     * reporting it would be promising a no-op.
+     */
+    public static Set<String> scanManifestKeys(byte[] manifest) {
+        Set<String> keys = new HashSet<>();
+
+        if (manifest == null || manifest.length < 8) {
+            return keys;
+        }
+
+        StringPool pool = null;
+        int resourceMapOffset = -1;
+
+        int cursor = 0;
+
+        while (cursor < manifest.length) {
+            if (cursor + 8 > manifest.length) {
+                return keys;
+            }
+
+            int type = readU16(manifest, cursor);
+            int headerSize = readU16(manifest, cursor + 2);
+            int chunkSize = readU32Checked(manifest, cursor + 4);
+
+            if (headerSize < 8 || chunkSize < headerSize ||
+                    (long) cursor + chunkSize > manifest.length) {
+                return keys;
+            }
+
+            if (type == RES_STRING_POOL_TYPE && pool == null) {
+                pool = StringPool.parse(manifest, cursor);
+            } else if (type == RES_XML_RESOURCE_MAP_TYPE) {
+                resourceMapOffset = cursor;
+            }
+
+            cursor += chunkSize;
+        }
+
+        if (pool == null || resourceMapOffset < 0) {
+            return keys;
+        }
+
+        Boolean debuggable = null;
+        Boolean allowBackup = null;
+        Boolean fullBackupOnly = null;
+        boolean exportedFalseFound = false;
+
+        cursor = 0;
+
+        while (cursor < manifest.length) {
+            int type = readU16(manifest, cursor);
+            int chunkSize = readU32Checked(manifest, cursor + 4);
+
+            if (type == RES_XML_START_ELEMENT_TYPE &&
+                    cursor + 36 <= manifest.length) {
+
+                int nodeHeaderSize = readU16(manifest, cursor + 2);
+
+                if (nodeHeaderSize >= 16 &&
+                        cursor + nodeHeaderSize + 20 <= manifest.length) {
+
+                    int ext = cursor + nodeHeaderSize;
+
+                    int attributeStart = readU16(manifest, ext + 8);
+                    int attributeSize = readU16(manifest, ext + 10);
+                    int attributeCount = readU16(manifest, ext + 12);
+
+                    if (attributeSize >= 20) {
+                        int base = ext + attributeStart;
+
+                        for (int i = 0; i < attributeCount; i++) {
+                            if ((long) base + (long) (i + 1) * attributeSize >
+                                    (long) cursor + chunkSize) {
+                                break;
+                            }
+
+                            int attr = base + i * attributeSize;
+
+                            int nameStringIndex =
+                                    readU32Checked(manifest, attr + 4);
+
+                            int resourceId = resolveResourceId(
+                                    manifest,
+                                    resourceMapOffset,
+                                    nameStringIndex
+                            );
+
+                            int dataType =
+                                    manifest[attr + 15] & 0xff;
+
+                            Boolean value = null;
+
+                            if (dataType == TYPE_INT_BOOLEAN) {
+                                value = readU32Checked(manifest, attr + 16) != 0;
+                            } else if (dataType == 0x03) {
+                                /*
+                                 * TYPE_STRING: compare the raw literal.
+                                 */
+                                String raw = poolString(
+                                        pool,
+                                        manifest,
+                                        readU32Checked(manifest, attr + 16)
+                                );
+
+                                if (raw != null) {
+                                    if ("true".equals(raw)) {
+                                        value = Boolean.TRUE;
+                                    } else if ("false".equals(raw)) {
+                                        value = Boolean.FALSE;
+                                    }
+                                }
+                            }
+
+                            if (value == null) {
+                                continue;
+                            }
+
+                            if (resourceId == ATTR_DEBUGGABLE) {
+                                debuggable = value;
+                            } else if (resourceId == ATTR_ALLOW_BACKUP) {
+                                allowBackup = value;
+                            } else if (resourceId == ATTR_FULL_BACKUP_ONLY) {
+                                fullBackupOnly = value;
+                            } else if (resourceId == ATTR_EXPORTED &&
+                                    !value.booleanValue()) {
+                                exportedFalseFound = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            cursor += chunkSize;
+        }
+
+        if (Boolean.FALSE.equals(debuggable)) {
+            keys.add("FORCE_DEBUGGABLE");
+        }
+
+        if (Boolean.FALSE.equals(allowBackup) ||
+                Boolean.TRUE.equals(fullBackupOnly)) {
+            keys.add("ALLOW_BACKUP");
+        }
+
+        if (exportedFalseFound) {
+            keys.add("EXPORT_ALL_COMPONENTS");
+        }
+
+        return keys;
+    }
+
+    private static String poolString(
+            StringPool pool,
+            byte[] data,
+            int index
+    ) {
+        if (index < 0 || index >= pool.stringCount) {
+            return null;
+        }
+
+        int abs = pool.chunkOffset +
+                pool.stringsStart +
+                pool.offsets[index];
+
+        if (abs < 0 || abs + 2 > data.length) {
+            return null;
+        }
+
+        try {
+            if ((pool.flags & 0x100) != 0) {
+                /*
+                 * UTF-8 pool: MUTF-8 with ULEB128 length.
+                 */
+                return readMutf8(data, abs);
+            }
+
+            /*
+             * UTF-16LE pool: u16 length, chars, NUL.
+             */
+            int len = readU16(data, abs);
+
+            if (abs + 2 + len * 2 > data.length) {
+                return null;
+            }
+
+            StringBuilder out = new StringBuilder(len);
+
+            for (int i = 0; i < len; i++) {
+                out.append((char) readU16(data, abs + 2 + i * 2));
+            }
+
+            return out.toString();
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -406,8 +735,7 @@ public final class SuperDexPatcher {
                 if ((method.accessFlags & (ACC_NATIVE | ACC_ABSTRACT)) != 0) {
                     /*
                      * Native and abstract methods carry no code_item.
-                     * Their encoded code_off must be 0; touching them is
-                     * always corruption.
+                     * Touching them is always corruption.
                      */
                     continue;
                 }
@@ -606,10 +934,8 @@ public final class SuperDexPatcher {
 
         if ("J".equals(returnType) || "D".equals(returnType)) {
             /*
-             * const-wide/16 v0, #0   0x1600 | vAA => 0x0016, literal 0x0000
-             * return-wide v0         0x1000 | vAA => 0x0010
-             *
-             * A wide value occupies the register pair v0/v1.
+             * const-wide/16 v0, #0   => 0x0016, literal 0x0000
+             * return-wide v0         => 0x0010
              */
             if (registersSize < 2) {
                 throw new IllegalArgumentException(
@@ -732,7 +1058,7 @@ public final class SuperDexPatcher {
          * ResXMLTree_attrExt (at nodeHeaderSize)
          *   ns             u32
          *   name           u32
-         *   attributeStart u16  (offset from attrExt to attributes)
+         *   attributeStart u16
          *   attributeSize  u16
          *   attributeCount u16
          *   idIndex        u16
@@ -1158,10 +1484,6 @@ public final class SuperDexPatcher {
              *   shorty_idx      u32 @ +0
              *   return_type_idx u32 @ +4
              *   parameters_off  u32 @ +8
-             *
-             * The previous revision read +8 here, which is parameters_off.
-             * For a zero-parameter method that value is 0, so type index 0
-             * resolved to whichever descriptor happened to sit there.
              */
             int shortyIndex = readU32(protoOffset);
             int returnTypeIndex = readU32(protoOffset + 4);
