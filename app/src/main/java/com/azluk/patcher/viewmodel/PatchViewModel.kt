@@ -5,7 +5,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.pm.PackageInstaller
+import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -15,6 +17,7 @@ import com.azluk.patcher.engine.ApkEngine
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import java.io.File
+import java.io.IOException
 
 data class AiDiagnosis(
     val loading:    Boolean = false,
@@ -31,6 +34,8 @@ data class PatchUiState(
     val aiDiagnosis:     AiDiagnosis      = AiDiagnosis(),
     val lastOutputPath:  String           = "",
     val scannedPkg:      String?          = null,
+    val scannedFile:     File?            = null,
+    val scannedFileName: String?          = null,
     val scanError:       String?          = null
 )
 
@@ -46,10 +51,13 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
 
     init { createChannel() }
 
-    // ── Scan ──────────────────────────────────────────────────────────────────
+    // ── Scan (installed apps) ─────────────────────────────────────────────────
 
     fun ensureScanned(pkg: String) {
-        if (_state.value.scannedPkg != pkg && !_state.value.isScanning) {
+        if (_state.value.scannedPkg != pkg &&
+            _state.value.scannedFile == null &&
+            !_state.value.isScanning
+        ) {
             scan(pkg)
         }
     }
@@ -60,7 +68,10 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
                 it.copy(
                     isScanning      = true,
                     scanResults     = emptyList(),
-                    scanError       = null
+                    scanError       = null,
+                    scannedPkg      = null,
+                    scannedFile     = null,
+                    scannedFileName = null
                 )
             }
 
@@ -91,6 +102,108 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
             )
+        }
+    }
+
+    // ── Scan + patch (imported files: APK / XAPK / APKM / APKS) ───────────────
+
+    /**
+     * Copies the SAF-selected Uri into app-owned cache (no ongoing
+     * URI-permission issues) and scans it. Routes internally to the APK
+     * or container scanner by extension.
+     */
+    fun importAndScan(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _state.update {
+                it.copy(
+                    isScanning      = true,
+                    scanResults     = emptyList(),
+                    scanError       = null,
+                    scannedPkg      = null,
+                    scannedFile     = null,
+                    scannedFileName = null
+                )
+            }
+
+            runCatching {
+                val app     = getApplication<Application>()
+                val resolver = app.contentResolver
+
+                val displayName = runCatching {
+                    resolver.query(
+                        uri,
+                        arrayOf(OpenableColumns.DISPLAY_NAME),
+                        null, null, null
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getString(0) else null
+                    }
+                }.getOrNull() ?: "import_${System.currentTimeMillis()}"
+
+                val safeName = displayName.replace(
+                    Regex("[^A-Za-z0-9._\\- ]"), "_"
+                )
+
+                val dir = File(app.cacheDir, "imports").apply { mkdirs() }
+                val dest = File(dir, safeName)
+
+                resolver.openInputStream(uri)?.use { input ->
+                    dest.outputStream().use { output ->
+                        input.copyTo(output, 256 * 1024)
+                    }
+                } ?: throw IOException("Cannot open selected file")
+
+                dest
+            }.fold(
+                onSuccess = { dest ->
+                    runCatching { engine.scanExternal(dest) }.fold(
+                        onSuccess = { list ->
+                            val detected = list.mapNotNull {
+                                runCatching { PatchType.valueOf(it.patchType) }.getOrNull()
+                            }.toSet()
+
+                            _state.update {
+                                it.copy(
+                                    isScanning      = false,
+                                    scannedFile     = dest,
+                                    scannedFileName = dest.name,
+                                    scanResults     = list,
+                                    selectedPatches = detected
+                                )
+                            }
+                        },
+                        onFailure = { e ->
+                            _state.update {
+                                it.copy(
+                                    isScanning = false,
+                                    scanError  = e.message ?: "Scan failed"
+                                )
+                            }
+                        }
+                    )
+                },
+                onFailure = { e ->
+                    _state.update {
+                        it.copy(
+                            isScanning = false,
+                            scanError  = e.message ?: "Import failed"
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    /**
+     * Single entry point for the Patch button: patches the imported file
+     * if one is loaded, otherwise the installed package.
+     */
+    fun patchActiveSource(pkg: String) {
+        val file = _state.value.scannedFile
+
+        if (file != null) {
+            patchFile(file)
+        } else {
+            patch(pkg)
         }
     }
 
