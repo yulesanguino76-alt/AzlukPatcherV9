@@ -5,6 +5,8 @@ import android.content.*
 import android.content.pm.PackageInstaller
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.widget.Toast
 import androidx.compose.animation.*
 import androidx.compose.foundation.*
@@ -30,10 +32,12 @@ import com.azluk.patcher.viewmodel.AiDiagnosis
 import com.azluk.patcher.viewmodel.PatchViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.zip.ZipInputStream
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -46,6 +50,8 @@ fun PatchedFilesScreen(
     var files   by remember { mutableStateOf<List<File>>(emptyList()) }
     val fmt     = SimpleDateFormat("MMM d, HH:mm", Locale.getDefault())
 
+    val mainHandler = Handler(Looper.getMainLooper())
+
     // Track which file is currently being installed (for per-card state)
     var activeFile by remember { mutableStateOf<String?>(null) }
 
@@ -53,6 +59,11 @@ fun PatchedFilesScreen(
     val installLog = remember { mutableStateListOf<String>() }
     var showLog    by remember { mutableStateOf(false) }
     val logState   = rememberLazyListState()
+
+    // Thread-safe log line (main thread only)
+    fun log(line: String) {
+        mainHandler.post { installLog.add(line) }
+    }
 
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
@@ -103,6 +114,11 @@ fun PatchedFilesScreen(
         files = runCatching { StorageUtils.getPatchedFiles() }.getOrDefault(emptyList())
     }
 
+    fun isContainerFile(f: File): Boolean =
+        f.extension.lowercase() in setOf("xapk", "apkm", "apks")
+
+    // ── Single APK install ────────────────────────────────────────────────────
+
     fun doInstallWithLog(file: File) {
         activeFile = file.absolutePath
         installLog.clear()
@@ -125,13 +141,13 @@ fun PatchedFilesScreen(
             }
             installLog.add("APK data written successfully")
             val receiverIntent = Intent("com.azluk.patcher.INSTALL_RESULT").apply {
-                setPackage(ctx.packageName)   // FIX: explicit package
+                setPackage(ctx.packageName)
             }
             val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
             else PendingIntent.FLAG_UPDATE_CURRENT
             val pending = PendingIntent.getBroadcast(ctx, sessionId, receiverIntent, flags)
-            session.commit(pending.intentSender)   // FIX: commit before close
+            session.commit(pending.intentSender)
             session.close()
             installLog.add("Session committed — waiting for Android installer...")
         } catch (e: Exception) {
@@ -139,6 +155,102 @@ fun PatchedFilesScreen(
             activeFile = null
             vm.onInstallResult(-1, e.message)
         }
+    }
+
+    // ── Container install (XAPK / APKM / APKS — base + splits, one session) ───
+
+    fun doInstallContainerWithLog(file: File) {
+        activeFile = file.absolutePath
+        installLog.clear()
+        showLog    = true
+        log("Starting container installation: ${file.name}")
+        log("Size: ${"%.1f".format(file.length() / 1048576f)} MB")
+        log("Mode: multi-APK session (base + splits together)")
+
+        Thread {
+            var session: PackageInstaller.Session? = null
+            var sessionId = -1
+
+            try {
+                val pi     = ctx.packageManager.packageInstaller
+                val params = PackageInstaller.SessionParams(
+                    PackageInstaller.SessionParams.MODE_FULL_INSTALL
+                )
+                sessionId = pi.createSession(params)
+                val s     = pi.openSession(sessionId)
+                session   = s
+
+                log("Session created: #$sessionId")
+
+                var apkCount = 0
+
+                ZipInputStream(
+                    BufferedInputStream(FileInputStream(file), 256 * 1024)
+                ).use { zip ->
+                    while (true) {
+                        val entry = zip.nextEntry ?: break
+
+                        if (!entry.isDirectory &&
+                            entry.name.endsWith(".apk", true)
+                        ) {
+                            val streamName = "azluk_split_$apkCount.apk"
+
+                            s.openWrite(
+                                streamName,
+                                0,
+                                if (entry.size > 0) entry.size else -1L
+                            ).use { os ->
+                                zip.copyTo(os, 65536)
+                                s.fsync(os)
+                            }
+
+                            apkCount++
+                            log("  staged ${entry.name}")
+                        }
+
+                        zip.closeEntry()
+                    }
+                }
+
+                if (apkCount == 0) {
+                    throw IllegalStateException("Container contains no APK files")
+                }
+
+                log("Staged $apkCount APK file(s) in session")
+
+                val receiverIntent = Intent("com.azluk.patcher.INSTALL_RESULT").apply {
+                    setPackage(ctx.packageName)
+                }
+                val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+                else PendingIntent.FLAG_UPDATE_CURRENT
+
+                s.commit(
+                    PendingIntent.getBroadcast(ctx, sessionId, receiverIntent, flags).intentSender
+                )
+                s.close()
+                session = null
+
+                log("Session committed — waiting for Android installer...")
+            } catch (e: Exception) {
+                /*
+                 * Only reached when the session was NOT committed — abandon
+                 * it so the installer doesn't leak sessions (limit ~1024).
+                 */
+                try { session?.abandon() } catch (_: Exception) {}
+                log("[ERROR] ${e.message}")
+                mainHandler.post {
+                    activeFile = null
+                    vm.onInstallResult(-1, e.message)
+                }
+            }
+        }.start()
+    }
+
+    // ── Dispatcher ────────────────────────────────────────────────────────────
+
+    fun doInstallAuto(file: File) {
+        if (isContainerFile(file)) doInstallContainerWithLog(file) else doInstallWithLog(file)
     }
 
     Scaffold(
@@ -174,7 +286,6 @@ fun PatchedFilesScreen(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(Modifier.padding(12.dp)) {
-                        // Log header
                         Row(
                             Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -201,7 +312,6 @@ fun PatchedFilesScreen(
 
                         Spacer(Modifier.height(6.dp))
 
-                        // Log lines
                         Box(Modifier.heightIn(max = 160.dp)) {
                             LazyColumn(state = logState) {
                                 items(installLog) { line ->
@@ -210,7 +320,8 @@ fun PatchedFilesScreen(
                                         color = when {
                                             line.contains("[SUCCESS]") -> AzlukSuccess
                                             line.contains("[ERROR]")   -> AzlukError
-                                            line.startsWith("Session") || line.startsWith("APK") -> AzlukCyan
+                                            line.startsWith("Session") || line.startsWith("Staged") -> AzlukCyan
+                                            line.startsWith("  staged") -> AzlukCyan
                                             else -> AzlukOnSurface
                                         },
                                         fontSize   = 10.sp,
@@ -221,7 +332,6 @@ fun PatchedFilesScreen(
                             }
                         }
 
-                        // AI suggestion — appears seamlessly after install failure
                         val ai = state.aiDiagnosis
                         AnimatedVisibility(ai.loading || ai.suggestion.isNotEmpty()) {
                             Column(Modifier.padding(top = 8.dp)) {
@@ -236,7 +346,6 @@ fun PatchedFilesScreen(
                                         Text("Analyzing error…", color = AzlukOnSurface, fontSize = 11.sp)
                                     }
                                 } else if (ai.suggestion.isNotEmpty()) {
-                                    // No "AI" label — suggestion appears as plain helpful text
                                     Surface(
                                         color  = AzlukBlue.copy(.06f),
                                         shape  = RoundedCornerShape(8.dp)
@@ -255,7 +364,6 @@ fun PatchedFilesScreen(
                             }
                         }
 
-                        // Install result action
                         when (val ist = state.installState) {
                             is InstallState.Success -> {
                                 Spacer(Modifier.height(8.dp))
@@ -270,10 +378,10 @@ fun PatchedFilesScreen(
                                 }
                             }
                             is InstallState.Failure -> {
-                                if (ist.canRetry && activeFile == null) {
+                                if (ist.canRetry && activeFile != null) {
                                     Spacer(Modifier.height(8.dp))
                                     Button(
-                                        onClick  = { activeFile?.let { doInstallWithLog(File(it)) } },
+                                        onClick  = { activeFile?.let { doInstallAuto(File(it)) } },
                                         modifier = Modifier.fillMaxWidth(),
                                         shape    = RoundedCornerShape(10.dp),
                                         colors   = ButtonDefaults.buttonColors(containerColor = AzlukBlue)
@@ -313,12 +421,14 @@ fun PatchedFilesScreen(
                             runCatching { ctx.packageManager.getPackageInfo(guessedPkg, 0); true }
                                 .getOrDefault(false)
                         }
+                        val isContainer = isContainerFile(file)
                         FileCard(
                             file         = file,
                             date         = fmt.format(Date(file.lastModified())),
                             isInstalling = isInstalling,
                             isInstalled  = isInstalled,
-                            onInstall    = { doInstallWithLog(file) },
+                            isContainer  = isContainer,
+                            onInstall    = { doInstallAuto(file) },
                             onReinstall  = {
                                 ctx.startActivity(Intent(Intent.ACTION_DELETE,
                                     Uri.parse("package:$guessedPkg")).apply {
@@ -343,6 +453,7 @@ private fun FileCard(
     date:         String,
     isInstalling: Boolean,
     isInstalled:  Boolean,
+    isContainer:  Boolean,
     onInstall:    () -> Unit,
     onReinstall:  () -> Unit,
     onDelete:     () -> Unit
@@ -360,7 +471,6 @@ private fun FileCard(
                 Modifier.padding(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Icon with installing indicator
                 Surface(
                     color  = if (isInstalling) AzlukBlue.copy(.15f) else AzlukBlue.copy(.08f),
                     shape  = RoundedCornerShape(10.dp)
@@ -369,7 +479,10 @@ private fun FileCard(
                         if (isInstalling) {
                             CircularProgressIndicator(Modifier.size(22.dp), color = AzlukBlue, strokeWidth = 2.dp)
                         } else {
-                            Icon(Icons.Default.Android, null, tint = AzlukBlue, modifier = Modifier.size(24.dp))
+                            Icon(
+                                if (isContainer) Icons.Default.FolderZip else Icons.Default.Android,
+                                null, tint = AzlukBlue, modifier = Modifier.size(24.dp)
+                            )
                         }
                     }
                 }
@@ -392,6 +505,12 @@ private fun FileCard(
                     if (isInstalling) {
                         Spacer(Modifier.height(3.dp))
                         Text("Installing...", color = AzlukBlue, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                    } else if (isContainer) {
+                        Spacer(Modifier.height(3.dp))
+                        Surface(color = AzlukWarning.copy(.1f), shape = RoundedCornerShape(4.dp)) {
+                            Text("Splits", color = AzlukWarning, fontSize = 10.sp,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp))
+                        }
                     } else if (isInstalled) {
                         Spacer(Modifier.height(3.dp))
                         Surface(color = AzlukSuccess.copy(.1f), shape = RoundedCornerShape(4.dp)) {
@@ -408,15 +527,13 @@ private fun FileCard(
                 }
             }
 
-            // Expandable action row
             AnimatedVisibility(expanded) {
                 Row(
                     Modifier
-                    .fillMaxWidth()
+                        .fillMaxWidth()
                         .padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    // Install
                     Button(
                         onClick  = { expanded = false; onInstall() },
                         enabled  = !isInstalling,
@@ -429,8 +546,7 @@ private fun FileCard(
                         Text("Install", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     }
 
-                    // Reinstall if already installed
-                    if (isInstalled) {
+                    if (isInstalled && !isContainer) {
                         OutlinedButton(
                             onClick  = { expanded = false; onReinstall() },
                             enabled  = !isInstalling,
@@ -444,7 +560,6 @@ private fun FileCard(
                         }
                     }
 
-                    // Delete
                     IconButton(onClick = onDelete, modifier = Modifier.size(40.dp)) {
                         Icon(Icons.Default.DeleteOutline, null, tint = AzlukError, modifier = Modifier.size(20.dp))
                     }
