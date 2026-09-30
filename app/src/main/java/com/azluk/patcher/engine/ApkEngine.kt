@@ -13,63 +13,49 @@ import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.FilterOutputStream
 import java.io.IOException
-import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.HashSet
 import java.util.concurrent.Callable
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.zip.CRC32
 import java.util.zip.ZipEntry
-import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 /**
  * AzlukPatcher V9 - APK Engine
  *
- * Transactional, streaming pipeline:
+ * Transactional pipeline:
  *
  *   INPUT
  *     |
  *     v
- *   analyze (ZipFile central directory, no decompression)
- *     - entry names validated (traversal / absolute / backslash)
- *     - duplicate names -> hard failure
- *     - signature entries dropped from the plan
- *     - per-entry size cap checked before any work
- *     - AndroidManifest.xml + >= 1 DEX required
+ *   ZIP validation
  *     |
  *     v
- *   transform (second pass, only requested entries hit disk)
- *     - manifest staged only if a manifest key applies
- *     - DEX staged only if a DEX key applies (bounded staging)
- *     - unchanged artifacts are removed and the original is streamed
+ *   file-backed staging
+ *     |
+ *     +--> DEX analysis/transformation
+ *     |
+ *     +--> binary XML transformation
  *     |
  *     v
- *   repack + align (third pass, entries stream input -> output)
- *     - exact byte counter flushed after every closeEntry
- *     - STORED: resources.arsc @ 4, native libs @ 4096/16384
- *     - unknown-size STORED entries spool to disk before header write
- *     - plan/lockstep order check, mismatch -> explicit IOException
+ *   ZIP repack + alignment
  *     |
  *     v
- *   signing (apksig V1/V2/V3, device-local Keystore key)
+ *   signing
  *     |
  *     v
- *   signature verification (self-check before publication)
+ *   signature verification
  *     |
  *     v
  *   atomic publication
  *
  * The destination is never modified before the whole pipeline succeeds.
- * No execution path can produce a silently broken APK: every transform
- * that cannot be proven valid throws instead of returning the original.
  */
 class ApkEngine(
     private val ctx: Context
@@ -80,25 +66,19 @@ class ApkEngine(
 
         private const val BUFFER_SIZE = 256 * 1024
 
-        /** Hard cap for any single materialized entry. */
         private const val MAX_ENTRY_SIZE =
             512L * 1024L * 1024L
 
-        /** Hard cap for everything staged on disk in one run. */
-        private const val MAX_STAGED_TOTAL =
-            1024L * 1024L * 1024L
+        private const val MAX_MANIFEST_SIZE =
+            8 * 1024 * 1024
 
         private const val MAX_CONTAINER_DEPTH = 1
 
         private val DEX_MAGIC = byteArrayOf(
-            0x64, 0x65, 0x78, 0x0a
-        )
-
-        /** Patch keys that are satisfied by binary XML surgery alone. */
-        private val MANIFEST_KEYS = setOf(
-            "FORCE_DEBUGGABLE",
-            "EXPORT_ALL_COMPONENTS",
-            "ALLOW_BACKUP"
+            0x64,
+            0x65,
+            0x78,
+            0x0a
         )
     }
 
@@ -114,8 +94,7 @@ class ApkEngine(
     }
 
     /**
-     * Serialized progress: every emit funnels through the main looper,
-     * so worker threads can log without interleaving partial lines.
+     * Sends progress messages in a serialized manner.
      */
     private fun emit(
         progress: Progress,
@@ -267,7 +246,7 @@ class ApkEngine(
     }
 
     // -------------------------------------------------------------------------
-    // Pipeline
+    // APK patching
     // -------------------------------------------------------------------------
 
     private fun patchToDisk(
@@ -287,53 +266,86 @@ class ApkEngine(
             "azluk-v9-${System.nanoTime()}"
         )
 
-        val staging = File(workRoot, "staged")
-        val unsigned = File(workRoot, "unsigned.apk")
-        val signed = File(workRoot, "signed.apk")
+        val staged = File(
+            workRoot,
+            "entries"
+        )
+
+        val unsigned = File(
+            workRoot,
+            "unsigned.apk"
+        )
+
+        val signed = File(
+            workRoot,
+            "signed.apk"
+        )
 
         workRoot.mkdirs()
-        staging.mkdirs()
+        staged.mkdirs()
 
         try {
-            emit(progress, "Phase 1/6 — analyzing APK structure")
+            emit(
+                progress,
+                "Phase 1/6 — validating APK"
+            )
 
-            val plan = analyze(input, progress)
+            val entries =
+                stageApk(
+                    input,
+                    staged,
+                    progress
+                )
 
-            emit(progress, "Phase 2/6 — transforming entries")
+            emit(
+                progress,
+                "Phase 2/6 — transforming entries"
+            )
 
-            val replacements = transform(
-                input,
+            transformEntries(
+                entries,
                 patches,
-                staging,
                 progress
             )
 
-            emit(progress, "Phase 3/6 — repacking and aligning")
+            emit(
+                progress,
+                "Phase 3/6 — repacking and aligning"
+            )
 
             repack(
-                input,
-                plan,
-                replacements,
-                unsigned,
-                staging,
-                progress
+                entries,
+                unsigned
             )
 
-            emit(progress, "Phase 4/6 — signing")
+            emit(
+                progress,
+                "Phase 4/6 — signing"
+            )
 
-            signer.signApk(unsigned, signed)
+            signer.signApk(
+                unsigned,
+                signed
+            )
 
-            emit(progress, "Phase 5/6 — verifying signature")
+            emit(
+                progress,
+                "Phase 5/6 — verifying signature"
+            )
 
-            val verification = signer.verify(signed)
+            val verification =
+                signer.verify(signed)
 
             if (!verification.verified) {
                 throw SecurityException(
-                    "Self-verification failed — output withheld"
+                    "Self-verification failed"
                 )
             }
 
-            if (!verification.v2 && !verification.v3) {
+            if (!verification.v2 &&
+                !verification.v3
+            ) {
+
                 throw SecurityException(
                     "No valid V2/V3 signature after signing"
                 )
@@ -346,9 +358,15 @@ class ApkEngine(
                         "V3=${verification.v3}"
             )
 
-            emit(progress, "Phase 6/6 — publishing atomically")
+            emit(
+                progress,
+                "Phase 6/6 — publishing atomically"
+            )
 
-            atomicPublish(signed, output)
+            atomicPublish(
+                signed,
+                output
+            )
 
             emit(
                 progress,
@@ -357,130 +375,34 @@ class ApkEngine(
             )
         } finally {
             /*
-             * Temp files die here on success and on failure alike.
-             * Publication already happened (or never will).
+             * Executor cleanup and temporary files are both handled here,
+             * regardless of success/failure.
              */
             workRoot.deleteRecursively()
         }
     }
 
     // -------------------------------------------------------------------------
-    // Pass 1: analyze (central directory, zero decompression)
+    // ZIP staging
     // -------------------------------------------------------------------------
 
-    private data class PlanEntry(
+    private data class StagedEntry(
         val name: String,
-        val directory: Boolean
+        val file: File,
+        val directory: Boolean,
+        val originalMethod: Int
     )
 
-    private fun analyze(
+    private fun stageApk(
         input: File,
-        progress: Progress
-    ): List<PlanEntry> {
-        val plan = ArrayList<PlanEntry>()
-        val names = HashSet<String>()
-        var hasManifest = false
-        var dexCount = 0
-
-        ZipFile(input).use { zipFile ->
-            val entries = zipFile.entries()
-
-            while (entries.hasMoreElements()) {
-                val entry = entries.nextElement()
-
-                validateEntryName(entry.name)
-
-                if (!names.add(entry.name)) {
-                    throw IOException(
-                        "Duplicate ZIP entry: ${entry.name}"
-                    )
-                }
-
-                /*
-                 * Old signatures are dropped from the plan; the repack
-                 * pass skips them with the same predicate.
-                 */
-                if (isSignatureEntry(entry.name)) {
-                    continue
-                }
-
-                if (entry.isDirectory) {
-                    plan.add(
-                        PlanEntry(entry.name, true)
-                    )
-                    continue
-                }
-
-                if (entry.size > MAX_ENTRY_SIZE) {
-                    throw IOException(
-                        "ZIP entry exceeds maximum allowed size: " +
-                                "${entry.name} (${entry.size} bytes)"
-                    )
-                }
-
-                if (entry.name == "AndroidManifest.xml") {
-                    hasManifest = true
-                }
-
-                if (entry.name.endsWith(".dex", true)) {
-                    dexCount++
-                }
-
-                plan.add(
-                    PlanEntry(entry.name, false)
-                )
-            }
-        }
-
-        if (!hasManifest) {
-            throw IOException("APK has no AndroidManifest.xml")
-        }
-
-        if (dexCount == 0) {
-            throw IOException("APK contains no DEX files")
-        }
-
-        emit(
-            progress,
-            "  ${plan.size} entries, $dexCount DEX, manifest OK"
-        )
-
-        return plan
-    }
-
-    // -------------------------------------------------------------------------
-    // Pass 2: transform (stage only what the recipes can touch)
-    // -------------------------------------------------------------------------
-
-    private fun transform(
-        input: File,
-        patches: List<PatchType>,
         staging: File,
         progress: Progress
-    ): Map<String, File> {
-        val keys =
-            patches.map { it.key }.toHashSet()
+    ): List<StagedEntry> {
+        val result =
+            ArrayList<StagedEntry>()
 
-        if (keys.isEmpty()) {
-            return emptyMap()
-        }
-
-        val needManifest =
-            keys.any { it in MANIFEST_KEYS }
-
-        val needDex =
-            keys.any { it !in MANIFEST_KEYS }
-
-        if (!needManifest && !needDex) {
-            return emptyMap()
-        }
-
-        /*
-         * Concurrent because the DEX pool removes unchanged entries
-         * from it while the manifest path runs on this thread.
-         */
-        val replacements = ConcurrentHashMap<String, File>()
-        var stagedBytes = 0L
+        val names =
+            HashSet<String>()
 
         ZipInputStream(
             BufferedInputStream(
@@ -490,7 +412,18 @@ class ApkEngine(
         ).use { zip ->
 
             while (true) {
-                val entry = zip.nextEntry ?: break
+                val entry =
+                    zip.nextEntry ?: break
+
+                validateEntryName(
+                    entry.name
+                )
+
+                if (!names.add(entry.name)) {
+                    throw IOException(
+                        "Duplicate ZIP entry: ${entry.name}"
+                    )
+                }
 
                 if (isSignatureEntry(entry.name)) {
                     drain(zip)
@@ -498,154 +431,234 @@ class ApkEngine(
                     continue
                 }
 
-                val stageManifest =
-                    needManifest &&
-                            !entry.isDirectory &&
-                            entry.name == "AndroidManifest.xml"
+                if (entry.isDirectory) {
+                    result.add(
+                        StagedEntry(
+                            entry.name,
+                            File(staging, safeFileName(entry.name)),
+                            true,
+                            entry.method
+                        )
+                    )
 
-                val stageDex =
-                    needDex &&
-                            !entry.isDirectory &&
-                            entry.name.endsWith(".dex", true)
-
-                if (!stageManifest && !stageDex) {
-                    drain(zip)
                     zip.closeEntry()
                     continue
                 }
 
-                if (stagedBytes >= MAX_STAGED_TOTAL) {
-                    throw IOException(
-                        "Staging budget exhausted: " +
-                                "$stagedBytes bytes materialized"
+                val target =
+                    File(
+                        staging,
+                        safeFileName(entry.name)
                     )
-                }
-
-                val target = File(
-                    staging,
-                    safeFileName(entry.name)
-                )
 
                 target.parentFile?.mkdirs()
 
-                stagedBytes += copyZipEntryToFile(zip, target)
+                copyZipEntryToFile(
+                    zip,
+                    target
+                )
 
-                if (stagedBytes > MAX_STAGED_TOTAL) {
-                    throw IOException(
-                        "Staging budget exceeded by ${entry.name}"
+                result.add(
+                    StagedEntry(
+                        entry.name,
+                        target,
+                        false,
+                        entry.method
                     )
-                }
+                )
 
-                replacements[entry.name] = target
-
-                emit(progress, "  staged ${entry.name}")
+                emit(
+                    progress,
+                    "  staged ${entry.name}"
+                )
 
                 zip.closeEntry()
             }
         }
 
-        // ---- binary XML -----------------------------------------------------
-
-        val manifestFile =
-            replacements["AndroidManifest.xml"]
-
-        if (manifestFile != null) {
-            emit(progress, "  patching AndroidManifest.xml")
-
-            val original = manifestFile.readBytes()
-            val transformed = SuperDexPatcher.patchManifest(
-                original,
-                keys
+        if (result.none {
+                it.name == "AndroidManifest.xml"
+            }) {
+            throw IOException(
+                "APK has no AndroidManifest.xml"
             )
+        }
 
-            if (original.contentEquals(transformed)) {
-                /*
-                 * Untouched manifest: drop the staged copy so the
-                 * repack pass streams the original bytes instead.
-                 */
-                manifestFile.delete()
-                replacements.remove("AndroidManifest.xml")
+        if (result.none {
+                it.name.endsWith(".dex", true)
+            }) {
+            throw IOException(
+                "APK contains no DEX files"
+            )
+        }
 
-                emit(progress, "  AndroidManifest.xml: no changes")
-            } else {
-                manifestFile.writeBytes(transformed)
+        return result
+    }
 
-                emit(progress, "  AndroidManifest.xml: changed")
+    private fun copyZipEntryToFile(
+        input: ZipInputStream,
+        output: File
+    ) {
+        var total = 0L
+
+        FileOutputStream(output).use { out ->
+            val buffer =
+                ByteArray(BUFFER_SIZE)
+
+            while (true) {
+                val read =
+                    input.read(buffer)
+
+                if (read == -1) {
+                    break
+                }
+
+                total += read
+
+                if (total > MAX_ENTRY_SIZE) {
+                    throw IOException(
+                        "ZIP entry exceeds maximum allowed size: " +
+                                output.name
+                    )
+                }
+
+                out.write(
+                    buffer,
+                    0,
+                    read
+                )
             }
         }
+    }
 
-        // ---- DEX ------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Transformations
+    // -------------------------------------------------------------------------
 
-        val dexReplacements = replacements.filterKeys {
-            it.endsWith(".dex", true)
+    private fun transformEntries(
+        entries: List<StagedEntry>,
+        patches: List<PatchType>,
+        progress: Progress
+    ) {
+        val keys =
+            patches
+                .map { it.key }
+                .toHashSet()
+
+        val manifestKeys =
+            setOf(
+                "FORCE_DEBUGGABLE",
+                "EXPORT_ALL_COMPONENTS",
+                "ALLOW_BACKUP"
+            )
+
+        val manifest =
+            entries.firstOrNull {
+                it.name == "AndroidManifest.xml"
+            }
+
+        if (manifest != null &&
+            keys.any { it in manifestKeys }
+        ) {
+
+            emit(
+                progress,
+                "  patching AndroidManifest.xml"
+            )
+
+            val bytes =
+                manifest.file.readBytes()
+
+            val transformed =
+                SuperDexPatcher.patchManifest(
+                    bytes,
+                    keys
+                )
+
+            manifest.file.writeBytes(
+                transformed
+            )
         }
 
-        if (dexReplacements.isEmpty()) {
-            return replacements
+        val dexEntries =
+            entries.filter {
+                !it.directory &&
+                        it.name.endsWith(".dex", true)
+            }
+
+        if (dexEntries.isEmpty()) {
+            return
         }
 
-        val executor = Executors.newFixedThreadPool(
-            minOf(
-                4,
-                maxOf(
-                    1,
-                    Runtime.getRuntime().availableProcessors()
+        val executor =
+            Executors.newFixedThreadPool(
+                minOf(
+                    4,
+                    maxOf(
+                        1,
+                        Runtime.getRuntime()
+                            .availableProcessors()
+                    )
                 )
             )
-        )
 
         try {
-            val futures = dexReplacements.map { (name, file) ->
+            val futures =
+                dexEntries.map { entry ->
 
-                executor.submit(
-                    Callable {
+                    executor.submit(
+                        Callable {
 
-                        emit(progress, "  patching $name")
-
-                        val original = file.readBytes()
-
-                        if (!isDex(original)) {
-                            throw IOException(
-                                "$name has invalid DEX magic"
+                            emit(
+                                progress,
+                                "  patching ${entry.name}"
                             )
-                        }
 
-                        val transformed =
-                            SuperDexPatcher.patch(
-                                original,
-                                keys
-                            ) { message ->
-                                emit(
-                                    progress,
-                                    "$name: $message"
-                                )
+                            val original =
+                                entry.file.readBytes()
+
+                            require(
+                                isDex(original)
+                            ) {
+                                "${entry.name} has invalid DEX magic"
                             }
 
-                        if (original.contentEquals(transformed)) {
-                            file.delete()
-                            replacements.remove(name)
+                            val transformed =
+                                SuperDexPatcher.patch(
+                                    original,
+                                    keys
+                                ) { message ->
+                                    emit(
+                                        progress,
+                                        "${entry.name}: $message"
+                                    )
+                                }
 
-                            emit(
-                                progress,
-                                "  $name: no changes"
-                            )
-                        } else {
-                            file.writeBytes(transformed)
+                            if (!original.contentEquals(
+                                    transformed
+                                )
+                            ) {
+                                entry.file.writeBytes(
+                                    transformed
+                                )
 
-                            emit(
-                                progress,
-                                "  $name: changed"
-                            )
+                                emit(
+                                    progress,
+                                    "  ${entry.name}: changed"
+                                )
+                            } else {
+                                emit(
+                                    progress,
+                                    "  ${entry.name}: no changes"
+                                )
+                            }
                         }
-                    }
-                )
-            }
+                    )
+                }
 
-            /*
-             * A failed patch surfaces here as ExecutionException —
-             * loud, before a single byte reaches the output zip.
-             */
-            futures.forEach { it.get() }
+            futures.forEach {
+                it.get()
+            }
         } finally {
             executor.shutdown()
 
@@ -667,289 +680,147 @@ class ApkEngine(
                 }
             }
         }
-
-        return replacements
     }
 
     // -------------------------------------------------------------------------
-    // Pass 3: repack + align (stream, exact offsets)
+    // ZIP repacking
     // -------------------------------------------------------------------------
-
-    /**
-     * Byte counter sitting between the ZipOutputStream's buffer and the
-     * file. After closeEntry() + flush() it holds the exact offset of the
-     * next local file header — the only value alignment math may trust.
-     */
-    private class CountingOutputStream(
-        inner: OutputStream
-    ) : FilterOutputStream(inner) {
-
-        var count: Long = 0L
-            private set
-
-        override fun write(b: Int) {
-            out.write(b)
-            count++
-        }
-
-        override fun write(b: ByteArray, off: Int, len: Int) {
-            out.write(b, off, len)
-            count += len
-        }
-    }
 
     private fun repack(
-        input: File,
-        plan: List<PlanEntry>,
-        replacements: Map<String, File>,
-        output: File,
-        staging: File,
-        progress: Progress
+        entries: List<StagedEntry>,
+        output: File
     ) {
         output.parentFile?.mkdirs()
 
-        val counting = CountingOutputStream(
-            FileOutputStream(output)
-        )
+        var offset = 0L
 
-        val buffered = BufferedOutputStream(
-            counting,
-            BUFFER_SIZE
-        )
+        ZipOutputStream(
+            BufferedOutputStream(
+                FileOutputStream(output),
+                BUFFER_SIZE
+            )
+        ).use { zip ->
 
-        var index = 0
-        var processed = 0
-
-        ZipOutputStream(buffered).use { out ->
-
-            ZipInputStream(
-                BufferedInputStream(
-                    FileInputStream(input),
-                    BUFFER_SIZE
-                )
-            ).use { zip ->
-
-                while (true) {
-                    val entry = zip.nextEntry ?: break
-
-                    if (isSignatureEntry(entry.name)) {
-                        drain(zip)
-                        zip.closeEntry()
-                        continue
-                    }
-
-                    val planned = plan.getOrNull(index)
-                        ?: throw IOException(
-                            "ZIP has more entries than the plan: " +
-                                    entry.name
+            for (entry in entries) {
+                if (entry.directory) {
+                    zip.putNextEntry(
+                        ZipEntry(
+                            ensureDirectoryName(entry.name)
                         )
+                    )
 
-                    if (planned.name != entry.name) {
-                        throw IOException(
-                            "ZIP entry order changed — expected " +
-                                    "${planned.name}, got ${entry.name}"
-                        )
-                    }
+                    zip.closeEntry()
 
-                    index++
+                    offset +=
+                        30L +
+                                entry.name.toByteArray(
+                                    StandardCharsets.UTF_8
+                                ).size
 
-                    // ---- directories ---------------------------------------
+                    continue
+                }
 
-                    if (planned.directory || entry.isDirectory) {
-                        out.putNextEntry(
-                            ZipEntry(
-                                ensureDirectoryName(entry.name)
-                            )
-                        )
-                        out.closeEntry()
-                        buffered.flush()
-                        continue
-                    }
+                val dataIsStored =
+                    shouldStore(entry.name)
 
-                    val replacement =
-                        replacements[entry.name]
-
-                    val nameBytes = entry.name.toByteArray(
+                val entryNameBytes =
+                    entry.name.toByteArray(
                         StandardCharsets.UTF_8
                     )
 
-                    // ---- STORED + alignment --------------------------------
+                val zipEntry =
+                    ZipEntry(entry.name)
 
-                    if (shouldStore(entry.name)) {
-                        val alignment =
-                            alignmentFor(entry.name)
+                if (dataIsStored) {
+                    val size =
+                        entry.file.length()
 
-                        val extra = createAlignmentExtra(
-                            counting.count,
-                            nameBytes.size,
+                    val crc =
+                        crc32(entry.file)
+
+                    zipEntry.method =
+                        ZipEntry.STORED
+
+                    zipEntry.size = size
+                    zipEntry.compressedSize = size
+                    zipEntry.crc = crc
+
+                    val alignment =
+                        alignmentFor(
+                            entry.name
+                        )
+
+                    zipEntry.extra =
+                        createAlignmentExtra(
+                            offset,
+                            entryNameBytes.size,
                             alignment
                         )
+                } else {
+                    zipEntry.method =
+                        ZipEntry.DEFLATED
+                }
 
-                        when {
-                            replacement != null -> {
-                                val size = replacement.length()
-                                val crc = crc32(replacement)
+                zip.putNextEntry(
+                    zipEntry
+                )
 
-                                out.putNextEntry(
-                                    storedEntry(
-                                        entry.name,
-                                        size,
-                                        crc,
-                                        extra
-                                    )
-                                )
-
-                                replacement
-                                    .inputStream()
-                                    .buffered(BUFFER_SIZE)
-                                    .use { src ->
-                                        src.copyTo(
-                                            out,
-                                            BUFFER_SIZE
-                                        )
-                                    }
-                            }
-
-                            entry.method == ZipEntry.STORED &&
-                                    entry.size >= 0L &&
-                                    entry.crc >= 0L -> {
-                                /*
-                                 * Sizes live in the local header —
-                                 * stream straight through, no copy.
-                                 */
-                                out.putNextEntry(
-                                    storedEntry(
-                                        entry.name,
-                                        entry.size,
-                                        entry.crc,
-                                        extra
-                                    )
-                                )
-
-                                zip.copyTo(out, BUFFER_SIZE)
-                            }
-
-                            else -> {
-                                /*
-                                 * Data-descriptor STORED entry: size and
-                                 * CRC are unknown until the last byte.
-                                 * Spool, compute, then write the header —
-                                 * guessing here is how zips get corrupt.
-                                 */
-                                val spool = File(
-                                    staging,
-                                    "spool_${safeFileName(entry.name)}"
-                                )
-
-                                spool.parentFile?.mkdirs()
-
-                                copyZipEntryToFile(zip, spool)
-
-                                val size = spool.length()
-                                val crc = crc32(spool)
-
-                                out.putNextEntry(
-                                    storedEntry(
-                                        entry.name,
-                                        size,
-                                        crc,
-                                        extra
-                                    )
-                                )
-
-                                spool
-                                    .inputStream()
-                                    .buffered(BUFFER_SIZE)
-                                    .use { src ->
-                                        src.copyTo(
-                                            out,
-                                            BUFFER_SIZE
-                                        )
-                                    }
-
-                                spool.delete()
-                            }
-                        }
-
-                        out.closeEntry()
-                        buffered.flush()
-
-                    } else {
-                        // ---- DEFLATED --------------------------------------
-
-                        val zipEntry = ZipEntry(entry.name)
-                        zipEntry.method = ZipEntry.DEFLATED
-
-                        out.putNextEntry(zipEntry)
-
-                        if (replacement != null) {
-                            replacement
-                                .inputStream()
-                                .buffered(BUFFER_SIZE)
-                                .use { src ->
-                                    src.copyTo(out, BUFFER_SIZE)
-                                }
-                        } else {
-                            /*
-                             * The hot path: bytes bounce from the input
-                             * inflater straight into the output deflater,
-                             * never touching the heap as a whole.
-                             */
-                            zip.copyTo(out, BUFFER_SIZE)
-                        }
-
-                        out.closeEntry()
-                        buffered.flush()
-                    }
-
-                    processed++
-
-                    if (processed % 25 == 0) {
-                        emit(
-                            progress,
-                            "  repacked $processed/${plan.size}"
+                entry.file.inputStream()
+                    .buffered(BUFFER_SIZE)
+                    .use { input ->
+                        input.copyTo(
+                            zip,
+                            BUFFER_SIZE
                         )
                     }
+
+                zip.closeEntry()
+
+                val extraSize =
+                    zipEntry.extra?.size ?: 0
+
+                if (dataIsStored) {
+                    offset +=
+                        30L +
+                                entryNameBytes.size +
+                                extraSize +
+                                entry.file.length()
+                } else {
+                    /*
+                     * For DEFLATED entries ZipOutputStream may produce a
+                     * data descriptor and a compressed size unknown until
+                     * closeEntry(). We do not use this offset for alignment
+                     * of compressed entries.
+                     */
+                    offset = approximateOffset(
+                        offset,
+                        zipEntry,
+                        entry.file.length(),
+                        entryNameBytes.size
+                    )
                 }
             }
-
-            if (index != plan.size) {
-                throw IOException(
-                    "ZIP entry count changed during repack — " +
-                            "planned ${plan.size}, saw $index"
-                )
-            }
         }
-
-        emit(
-            progress,
-            "  repacked $processed entries, " +
-                    "alignments from exact offsets"
-        )
     }
 
-    private fun storedEntry(
-        name: String,
-        size: Long,
-        crc: Long,
-        extra: ByteArray?
-    ): ZipEntry {
-        val entry = ZipEntry(name)
-
-        entry.method = ZipEntry.STORED
-        entry.size = size
-        entry.compressedSize = size
-        entry.crc = crc
-        entry.extra = extra
-
-        return entry
+    private fun approximateOffset(
+        current: Long,
+        entry: ZipEntry,
+        uncompressedSize: Long,
+        nameSize: Int
+    ): Long {
+        /*
+         * Alignment is only applied to STORED entries, so exact compressed
+         * offsets are not needed for later alignment decisions.
+         *
+         * We conservatively leave offset tracking monotonic.
+         */
+        return current +
+                30L +
+                nameSize +
+                uncompressedSize
     }
 
-    /**
-     * Local header is 30 bytes; data begins at
-     * offset + 30 + nameLen + extraLen. Pad the extra field so that
-     * value lands on the alignment boundary.
-     */
     private fun createAlignmentExtra(
         currentOffset: Long,
         nameLength: Int,
@@ -959,6 +830,23 @@ class ApkEngine(
             return null
         }
 
+        /*
+         * Local file header:
+         *
+         * signature 4
+         * version 2
+         * flags 2
+         * method 2
+         * time 2
+         * date 2
+         * crc 4
+         * compressed size 4
+         * size 4
+         * name length 2
+         * extra length 2
+         *
+         * = 30 bytes
+         */
         val base =
             currentOffset +
                     30L +
@@ -970,12 +858,11 @@ class ApkEngine(
                     alignment).toInt()
 
         if (extraLength == 0) {
-            // Already aligned — an empty extra would only shift it.
             return null
         }
 
         /*
-         * Extra fields need at least four bytes:
+         * Extra fields themselves need at least four bytes:
          *   header-id u16
          *   data-size u16
          */
@@ -989,20 +876,30 @@ class ApkEngine(
             )
         }
 
-        val dataLength = extraLength - 4
+        val dataLength =
+            extraLength - 4
 
-        val extra = ByteArray(extraLength)
+        val extra =
+            ByteArray(extraLength)
 
-        // Private padding field id.
+        /*
+         * Private padding field ID.
+         */
         extra[0] = 0x99.toByte()
         extra[1] = 0x99.toByte()
-        extra[2] = (dataLength and 0xff).toByte()
-        extra[3] = ((dataLength ushr 8) and 0xff).toByte()
+
+        extra[2] =
+            (dataLength and 0xff).toByte()
+
+        extra[3] =
+            ((dataLength ushr 8) and 0xff).toByte()
 
         return extra
     }
 
-    private fun shouldStore(name: String): Boolean {
+    private fun shouldStore(
+        name: String
+    ): Boolean {
         return name.equals(
             "resources.arsc",
             ignoreCase = true
@@ -1012,12 +909,17 @@ class ApkEngine(
         )
     }
 
-    private fun alignmentFor(name: String): Int {
-        return if (name.endsWith(".so", ignoreCase = true)) {
+    private fun alignmentFor(
+        name: String
+    ): Int {
+        return if (name.endsWith(
+                ".so",
+                ignoreCase = true
+            )
+        ) {
             /*
-             * 16 KiB covers 16K-page devices (Android 15+) and is a
-             * valid multiple for every 4K-page device shipping today.
-             * resources.arsc stays at 4 bytes for targetSdk 30+.
+             * 16 KiB alignment is compatible with the 16K-page Android
+             * direction and is also a valid multiple for current devices.
              */
             16 * 1024
         } else {
@@ -1026,43 +928,7 @@ class ApkEngine(
     }
 
     // -------------------------------------------------------------------------
-    // Entry extraction
-    // -------------------------------------------------------------------------
-
-    private fun copyZipEntryToFile(
-        input: ZipInputStream,
-        output: File
-    ): Long {
-        var total = 0L
-
-        FileOutputStream(output).use { out ->
-            val buffer = ByteArray(BUFFER_SIZE)
-
-            while (true) {
-                val read = input.read(buffer)
-
-                if (read == -1) {
-                    break
-                }
-
-                total += read
-
-                if (total > MAX_ENTRY_SIZE) {
-                    throw IOException(
-                        "ZIP entry exceeds maximum allowed size: " +
-                                output.name
-                    )
-                }
-
-                out.write(buffer, 0, read)
-            }
-        }
-
-        return total
-    }
-
-    // -------------------------------------------------------------------------
-    // XAPK/APKM/APKS containers
+    // XAPK/APKM/APKS
     // -------------------------------------------------------------------------
 
     private fun patchContainer(
@@ -1071,26 +937,41 @@ class ApkEngine(
         patches: List<PatchType>,
         progress: Progress
     ): File {
-        val root = File(
-            ctx.cacheDir,
-            "azluk-container-${System.nanoTime()}"
-        )
+        val root =
+            File(
+                ctx.cacheDir,
+                "azluk-container-${System.nanoTime()}"
+            )
 
-        val extracted = File(root, "extracted")
-        val patched = File(root, "patched")
+        val extracted =
+            File(root, "extracted")
+
+        val patched =
+            File(root, "patched")
 
         root.mkdirs()
         extracted.mkdirs()
         patched.mkdirs()
 
         try {
-            emit(progress, "Container: ${input.name}")
+            emit(
+                progress,
+                "Container: ${input.name}"
+            )
 
-            val files = extractContainer(input, extracted)
+            val files =
+                extractContainer(
+                    input,
+                    extracted
+                )
 
-            val apkFiles = files.filter {
-                it.extension.equals("apk", true)
-            }
+            val apkFiles =
+                files.filter {
+                    it.extension.equals(
+                        "apk",
+                        true
+                    )
+                }
 
             if (apkFiles.isEmpty()) {
                 throw IOException(
@@ -1098,15 +979,12 @@ class ApkEngine(
                 )
             }
 
-            /*
-             * Every split APK is signed with the same Keystore key —
-             * a set with mixed certificates refuses to install.
-             */
             for (apk in apkFiles) {
-                val destination = File(
-                    patched,
-                    apk.relativeTo(extracted).path
-                )
+                val destination =
+                    File(
+                        patched,
+                        apk.relativeTo(extracted)
+                    )
 
                 destination.parentFile?.mkdirs()
 
@@ -1123,15 +1001,20 @@ class ApkEngine(
                 )
             }
 
-            val unchanged = files.filter {
-                !it.extension.equals("apk", true)
-            }
+            val unchanged =
+                files.filter {
+                    !it.extension.equals(
+                        "apk",
+                        true
+                    )
+                }
 
             for (file in unchanged) {
-                val destination = File(
-                    patched,
-                    file.relativeTo(extracted).path
-                )
+                val destination =
+                    File(
+                        patched,
+                        file.relativeTo(extracted)
+                    )
 
                 destination.parentFile?.mkdirs()
 
@@ -1142,7 +1025,10 @@ class ApkEngine(
                 )
             }
 
-            repackContainer(patched, output)
+            repackContainer(
+                patched,
+                output
+            )
 
             return output
         } finally {
@@ -1154,8 +1040,8 @@ class ApkEngine(
         input: File,
         root: File
     ): List<File> {
-        val result = ArrayList<File>()
-        val names = HashSet<String>()
+        val result =
+            ArrayList<File>()
 
         ZipInputStream(
             BufferedInputStream(
@@ -1165,27 +1051,32 @@ class ApkEngine(
         ).use { zip ->
 
             while (true) {
-                val entry = zip.nextEntry ?: break
+                val entry =
+                    zip.nextEntry ?: break
 
-                validateEntryName(entry.name)
+                validateEntryName(
+                    entry.name
+                )
 
-                if (!names.add(entry.name)) {
-                    throw IOException(
-                        "Duplicate ZIP entry in container: " +
-                                entry.name
+                val destination =
+                    File(
+                        root,
+                        entry.name
                     )
-                }
-
-                val destination = File(root, entry.name)
 
                 if (entry.isDirectory) {
                     destination.mkdirs()
                 } else {
                     destination.parentFile?.mkdirs()
 
-                    copyZipEntryToFile(zip, destination)
+                    copyZipEntryToFile(
+                        zip,
+                        destination
+                    )
 
-                    result.add(destination)
+                    result.add(
+                        destination
+                    )
                 }
 
                 zip.closeEntry()
@@ -1208,24 +1099,35 @@ class ApkEngine(
             )
         ).use { zip ->
 
-            val files = root.walkTopDown()
-                .filter { it.isFile }
-                .toList()
+            val files =
+                root.walkTopDown()
+                    .filter { it.isFile }
+                    .toList()
 
             for (file in files) {
-                val name = file.relativeTo(root)
-                    .path
-                    .replace(File.separatorChar, '/')
+                val name =
+                    file.relativeTo(root)
+                        .path
+                        .replace(
+                            File.separatorChar,
+                            '/'
+                        )
 
-                val entry = ZipEntry(name)
-                entry.method = ZipEntry.DEFLATED
+                val entry =
+                    ZipEntry(name)
+
+                entry.method =
+                    ZipEntry.DEFLATED
 
                 zip.putNextEntry(entry)
 
                 file.inputStream()
                     .buffered(BUFFER_SIZE)
                     .use { input ->
-                        input.copyTo(zip, BUFFER_SIZE)
+                        input.copyTo(
+                            zip,
+                            BUFFER_SIZE
+                        )
                     }
 
                 zip.closeEntry()
@@ -1240,7 +1142,8 @@ class ApkEngine(
     fun scanFile(
         apk: File
     ): List<ScanResult> {
-        val result = ArrayList<ScanResult>()
+        val result =
+            ArrayList<ScanResult>()
 
         var dexIndex = 0
 
@@ -1252,32 +1155,70 @@ class ApkEngine(
         ).use { zip ->
 
             while (true) {
-                val entry = zip.nextEntry ?: break
+                val entry =
+                    zip.nextEntry ?: break
 
-                if (entry.name.endsWith(".dex", true)) {
-
-                    val matches =
-                        SuperDexPatcher.quickScan(zip)
-
-                    for (match in matches) {
-                        result.add(
-                            ScanResult(
-                                match[0],
-                                match.getOrNull(1),
-                                dexIndex,
-                                0
+                when {
+                    entry.name.endsWith(
+                        ".dex",
+                        true
+                    ) -> {
+                        val matches =
+                            SuperDexPatcher.quickScan(
+                                zip
                             )
-                        )
+
+                        for (match in matches) {
+                            result.add(
+                                ScanResult(
+                                    match[0],
+                                    match.getOrNull(1),
+                                    dexIndex,
+                                    0
+                                )
+                            )
+                        }
+
+                        dexIndex++
                     }
 
-                    dexIndex++
-                } else {
-                    drain(zip)
+                    entry.name.equals(
+                        "AndroidManifest.xml",
+                        true
+                    ) -> {
+                        val bytes =
+                            readEntryBounded(
+                                zip,
+                                MAX_MANIFEST_SIZE
+                            )
+
+                        for (key in SuperDexPatcher.scanManifestKeys(bytes)) {
+                            result.add(
+                                ScanResult(
+                                    key,
+                                    "Manifest attribute patchable",
+                                    -1,
+                                    0
+                                )
+                            )
+                        }
+                    }
+
+                    else -> drain(zip)
                 }
 
                 zip.closeEntry()
             }
         }
+
+        result.add(
+            ScanResult(
+                "OPTIMIZE_ZIP",
+                "Repack-level optimization, always available",
+                -1,
+                0
+            )
+        )
 
         return result
             .distinctBy {
@@ -1285,37 +1226,94 @@ class ApkEngine(
             }
     }
 
+    private fun readEntryBounded(
+        input: ZipInputStream,
+        max: Int
+    ): ByteArray {
+        val out =
+            java.io.ByteArrayOutputStream()
+
+        val buffer =
+            ByteArray(BUFFER_SIZE)
+
+        var total = 0
+
+        while (true) {
+            val read =
+                input.read(buffer)
+
+            if (read == -1) {
+                break
+            }
+
+            total += read
+
+            if (total > max) {
+                throw IOException(
+                    "Manifest exceeds maximum scan size"
+                )
+            }
+
+            out.write(
+                buffer,
+                0,
+                read
+            )
+        }
+
+        return out.toByteArray()
+    }
+
     // -------------------------------------------------------------------------
     // ZIP safety
     // -------------------------------------------------------------------------
 
-    private fun validateEntryName(name: String) {
+    private fun validateEntryName(
+        name: String
+    ) {
         require(name.isNotBlank()) {
             "ZIP contains an empty entry name"
         }
 
-        require(!name.startsWith("/")) {
+        require(
+            !name.startsWith("/")
+        ) {
             "Absolute ZIP path is forbidden: $name"
         }
 
-        require(!name.contains("\\")) {
+        require(
+            !name.contains("\\")
+        ) {
             "Backslash path is forbidden: $name"
         }
 
-        val parts = name.split('/')
+        val parts =
+            name.split('/')
 
-        require(parts.none { it == ".." }) {
+        require(
+            parts.none { it == ".." }
+        ) {
             "Path traversal detected: $name"
         }
     }
 
-    private fun safeFileName(name: String): String {
+    private fun safeFileName(
+        name: String
+    ): String {
         return name
-            .replace('/', '_')
-            .replace(':', '_')
+            .replace(
+                '/',
+                '_'
+            )
+            .replace(
+                ':',
+                '_'
+            )
     }
 
-    private fun ensureDirectoryName(name: String): String {
+    private fun ensureDirectoryName(
+        name: String
+    ): String {
         return if (name.endsWith('/')) {
             name
         } else {
@@ -1323,20 +1321,44 @@ class ApkEngine(
         }
     }
 
-    private fun isSignatureEntry(name: String): Boolean {
-        if (!name.startsWith("META-INF/", true)) {
+    private fun isSignatureEntry(
+        name: String
+    ): Boolean {
+        if (!name.startsWith(
+                "META-INF/",
+                true
+            )
+        ) {
             return false
         }
 
-        return name.endsWith(".SF", true) ||
-                name.endsWith(".RSA", true) ||
-                name.endsWith(".DSA", true) ||
-                name.endsWith(".EC", true) ||
-                name.endsWith(".MF", true)
+        return name.endsWith(
+            ".SF",
+            true
+        ) ||
+                name.endsWith(
+                    ".RSA",
+                    true
+                ) ||
+                name.endsWith(
+                    ".DSA",
+                    true
+                ) ||
+                name.endsWith(
+                    ".EC",
+                    true
+                ) ||
+                name.endsWith(
+                    ".MF",
+                    true
+                )
     }
 
-    private fun drain(input: ZipInputStream) {
-        val buffer = ByteArray(BUFFER_SIZE)
+    private fun drain(
+        input: ZipInputStream
+    ) {
+        val buffer =
+            ByteArray(BUFFER_SIZE)
 
         while (input.read(buffer) != -1) {
             // intentionally drained
@@ -1369,7 +1391,9 @@ class ApkEngine(
         }
     }
 
-    private fun isDex(data: ByteArray): Boolean {
+    private fun isDex(
+        data: ByteArray
+    ): Boolean {
         return data.size >= 8 &&
                 data[0] == DEX_MAGIC[0] &&
                 data[1] == DEX_MAGIC[1] &&
@@ -1377,43 +1401,60 @@ class ApkEngine(
                 data[3] == DEX_MAGIC[3]
     }
 
-    private fun crc32(file: File): Long {
-        val crc = CRC32()
+    private fun crc32(
+        file: File
+    ): Long {
+        val crc =
+            CRC32()
 
         file.inputStream()
             .buffered(BUFFER_SIZE)
             .use { input ->
 
-                val buffer = ByteArray(BUFFER_SIZE)
+                val buffer =
+                    ByteArray(BUFFER_SIZE)
 
                 while (true) {
-                    val read = input.read(buffer)
+                    val read =
+                        input.read(buffer)
 
                     if (read == -1) {
                         break
                     }
 
-                    crc.update(buffer, 0, read)
+                    crc.update(
+                        buffer,
+                        0,
+                        read
+                    )
                 }
             }
 
         return crc.value
     }
 
-    private fun formatSize(bytes: Long): String {
+    private fun formatSize(
+        bytes: Long
+    ): String {
         return when {
             bytes < 1024 ->
                 "$bytes B"
 
             bytes < 1024L * 1024L ->
-                "%.1f KB".format(bytes / 1024.0)
+                "%.1f KB".format(
+                    bytes / 1024.0
+                )
 
             bytes < 1024L * 1024L * 1024L ->
-                "%.1f MB".format(bytes / (1024.0 * 1024.0))
+                "%.1f MB".format(
+                    bytes /
+                            (1024.0 * 1024.0)
+                )
 
             else ->
                 "%.2f GB".format(
-                    bytes / (1024.0 * 1024.0 * 1024.0)
+                    bytes /
+                            (1024.0 * 1024.0 * 1024.0)
                 )
         }
     }
