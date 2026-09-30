@@ -38,7 +38,7 @@ fun PatchLogScreen(pkg: String, navController: NavController, vm: PatchViewModel
     val logState = rememberLazyListState()
 
     // Kick patch unconditionally — PatchViewModel guards duplicate calls internally
-    LaunchedEffect(pkg) { vm.patch(pkg) }
+    LaunchedEffect(pkg) { vm.patchActiveSource(pkg) }
 
     val logLines = when (val ps = state.patchState) {
         is PatchState.Running -> ps.log
@@ -192,7 +192,7 @@ fun PatchLogScreen(pkg: String, navController: NavController, vm: PatchViewModel
                     }
                 }
 
-                Button(onClick = { doInstall(ctx, File(outputPath), vm) },
+                Button(onClick = { installFileAuto(ctx, File(outputPath), vm) },
                     modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = AzlukBlue)) {
                     Icon(Icons.Default.InstallMobile, null, Modifier.size(18.dp))
@@ -245,7 +245,7 @@ fun PatchLogScreen(pkg: String, navController: NavController, vm: PatchViewModel
                                     Text(ai.suggestion, color = AzlukOnBg, fontSize = 12.sp, lineHeight = 18.sp)
                                 }
                                 if (ist.canRetry) {
-                                    Button(onClick = { doInstall(ctx, File(outputPath), vm) },
+                                    Button(onClick = { installFileAuto(ctx, File(outputPath), vm) },
                                         modifier = Modifier.fillMaxWidth(),
                                         colors = ButtonDefaults.buttonColors(containerColor = AzlukBlue),
                                         shape = RoundedCornerShape(10.dp)) {
@@ -308,4 +308,77 @@ fun systemInstall(ctx: Context, file: File) {
     } catch (e: Exception) {
         Toast.makeText(ctx, "System install error: ${e.message}", Toast.LENGTH_LONG).show()
     }
+}
+fun installFileAuto(ctx: Context, file: File, vm: PatchViewModel) {
+    if (!file.exists()) { Toast.makeText(ctx, "APK not found", Toast.LENGTH_SHORT).show(); return }
+    when (file.extension.lowercase()) {
+        "xapk", "apkm", "apks" -> doInstallContainer(ctx, file, vm)
+        else -> doInstall(ctx, file, vm)
+    }
+}
+
+fun doInstallContainer(ctx: Context, file: File, vm: PatchViewModel) {
+    Toast.makeText(ctx, "Installing container: ${file.name}", Toast.LENGTH_SHORT).show()
+
+    Thread {
+        var session: PackageInstaller.Session? = null
+        var sessionId = -1
+
+        try {
+            val pi     = ctx.packageManager.packageInstaller
+            val params = PackageInstaller.SessionParams(
+                PackageInstaller.SessionParams.MODE_FULL_INSTALL
+            )
+            sessionId = pi.createSession(params)
+            val s     = pi.openSession(sessionId)
+            session   = s
+
+            var apkCount = 0
+
+            java.util.zip.ZipInputStream(
+                java.io.BufferedInputStream(java.io.FileInputStream(file), 256 * 1024)
+            ).use { zip ->
+                while (true) {
+                    val entry = zip.nextEntry ?: break
+
+                    if (!entry.isDirectory &&
+                        entry.name.endsWith(".apk", true)
+                    ) {
+                        s.openWrite(
+                            "azluk_split_$apkCount.apk",
+                            0,
+                            if (entry.size > 0) entry.size else -1L
+                        ).use { os ->
+                            zip.copyTo(os, 65536)
+                            s.fsync(os)
+                        }
+                        apkCount++
+                    }
+
+                    zip.closeEntry()
+                }
+            }
+
+            if (apkCount == 0) {
+                throw IllegalStateException("Container contains no APK files")
+            }
+
+            val intent = Intent("com.azluk.patcher.INSTALL_RESULT").apply {
+                setPackage(ctx.packageName)
+            }
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+            else PendingIntent.FLAG_UPDATE_CURRENT
+
+            s.commit(PendingIntent.getBroadcast(ctx, sessionId, intent, flags).intentSender)
+            s.close()
+            session = null
+        } catch (e: Exception) {
+            try { session?.abandon() } catch (_: Exception) {}
+            android.os.Handler(ctx.mainLooper).post {
+                Toast.makeText(ctx, "Install error: ${e.message}", Toast.LENGTH_LONG).show()
+                vm.onInstallResult(-1, e.message)
+            }
+        }
+    }.start()
 }
