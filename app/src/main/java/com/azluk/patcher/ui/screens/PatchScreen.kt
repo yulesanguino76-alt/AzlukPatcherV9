@@ -61,7 +61,7 @@ fun PatchScreen(pkg: String, navController: NavController, vm: PatchViewModel = 
     val state by vm.state.collectAsStateWithLifecycle()
 
     LaunchedEffect(pkg) {
-        if (state.scanResults.isEmpty() && !state.isScanning) vm.scan(pkg)
+        vm.ensureScanned(pkg)
     }
 
     val categories = PatchType.values().groupBy { it.category }
@@ -175,6 +175,25 @@ fun PatchScreen(pkg: String, navController: NavController, vm: PatchViewModel = 
                             TextButton(onClick = { vm.selectAll(detectedTypes) }) {
                                 Text("Select All", color = AzlukBlue, fontSize = 12.sp)
                             }
+                        }
+                    }
+                }
+            }
+
+            state.scanError?.let { err ->
+                item {
+                    Surface(
+                        color  = AzlukError.copy(.08f),
+                        shape  = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.dp, AzlukError.copy(.25f))
+                    ) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.Warning, null, tint = AzlukError, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Scan failed: $err", color = AzlukError, fontSize = 12.sp)
                         }
                     }
                 }
