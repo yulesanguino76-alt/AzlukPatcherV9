@@ -353,9 +353,9 @@ class ApkSignerV2(
             .build()
             .verify()
 
-        val signerCertificates =
-            result.signers.flatMap { signer ->
-                signer.certs
+        val signerCertificate
+            result.signerInfos.flatMap { signerInfo ->
+                signerInfo.certs
             }
 
         val fingerprints =
