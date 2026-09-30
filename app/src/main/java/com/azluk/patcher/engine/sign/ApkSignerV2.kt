@@ -353,14 +353,12 @@ class ApkSignerV2(
             .build()
             .verify()
 
-        val signerCertificate
-            result.signerInfos.flatMap { signerInfo ->
-                signerInfo.certs
-            }
+        val signerCertificates: List<X509Certificate> =
+            result.signerCertificates
 
         val fingerprints =
-            signerCertificates.map {
-                sha256(it)
+            signerCertificates.map { cert ->
+                sha256(cert)
             }
 
         return VerificationResult(
