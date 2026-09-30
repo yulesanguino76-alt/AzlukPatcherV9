@@ -1105,7 +1105,7 @@ class ApkEngine(
             for (apk in apkFiles) {
                 val destination = File(
                     patched,
-                    apk.relativeTo(extracted)
+                    apk.relativeTo(extracted).path
                 )
 
                 destination.parentFile?.mkdirs()
@@ -1130,7 +1130,7 @@ class ApkEngine(
             for (file in unchanged) {
                 val destination = File(
                     patched,
-                    file.relativeTo(extracted)
+                    file.relativeTo(extracted).path
                 )
 
                 destination.parentFile?.mkdirs()
