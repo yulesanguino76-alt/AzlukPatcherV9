@@ -29,7 +29,9 @@ data class PatchUiState(
     val scanResults:     List<ScanResult> = emptyList(),
     val isScanning:      Boolean          = false,
     val aiDiagnosis:     AiDiagnosis      = AiDiagnosis(),
-    val lastOutputPath:  String           = ""
+    val lastOutputPath:  String           = "",
+    val scannedPkg:      String?          = null,
+    val scanError:       String?          = null
 )
 
 class PatchViewModel(app: Application) : AndroidViewModel(app) {
@@ -46,21 +48,49 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
 
     // ── Scan ──────────────────────────────────────────────────────────────────
 
+    fun ensureScanned(pkg: String) {
+        if (_state.value.scannedPkg != pkg && !_state.value.isScanning) {
+            scan(pkg)
+        }
+    }
+
     fun scan(pkg: String) {
         viewModelScope.launch(Dispatchers.IO) {
-            _state.update { it.copy(isScanning = true, scanResults = emptyList()) }
-            val results = runCatching { engine.scan(pkg) }.getOrDefault(emptyList())
-            val detected = results.mapNotNull {
-                runCatching { PatchType.valueOf(it.patchType) }.getOrNull()
-            }.toSet()
             _state.update {
                 it.copy(
-                    isScanning      = false,
-                    scanResults     = results,
-                    selectedPatches = if (detected.isNotEmpty()) detected
-                                     else setOf(PatchType.LICENSE_BYPASS, PatchType.REMOVE_ADS)
+                    isScanning      = true,
+                    scanResults     = emptyList(),
+                    scanError       = null
                 )
             }
+
+            runCatching { engine.scan(pkg) }.fold(
+                onSuccess = { list ->
+                    val detected = list.mapNotNull {
+                        runCatching { PatchType.valueOf(it.patchType) }.getOrNull()
+                    }.toSet()
+
+                    _state.update {
+                        it.copy(
+                            isScanning      = false,
+                            scannedPkg      = pkg,
+                            scanResults     = list,
+                            selectedPatches = detected
+                        )
+                    }
+                },
+                onFailure = { e ->
+                    _state.update {
+                        it.copy(
+                            isScanning      = false,
+                            scannedPkg      = pkg,
+                            scanError       = e.message ?: "Scan failed",
+                            scanResults     = emptyList(),
+                            selectedPatches = emptySet()
+                        )
+                    }
+                }
+            )
         }
     }
 
