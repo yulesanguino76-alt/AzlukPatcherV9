@@ -789,7 +789,7 @@ public final class SuperDexPatcher {
         for (int i = 0; i < attributeCount; i++) {
             int attr = attributesBase + i * attributeSize;
 
-            int nameStringIndex = readU32(data, attr + 4);
+            int nameStringIndex = readU32Checked(data, attr + 4);
 
             int resourceId = resolveResourceId(
                     data,
@@ -857,7 +857,7 @@ public final class SuperDexPatcher {
             return 0;
         }
 
-        return readU32(data, (int) (mapBase + (long) stringIndex * 4L));
+        return readU32Checked(data, (int) (mapBase + (long) stringIndex * 4L));
     }
 
     private static void writeBooleanValue(
