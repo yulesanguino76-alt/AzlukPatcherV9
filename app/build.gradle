@@ -33,9 +33,9 @@ android {
         //   ./gradlew assembleDebug -PTOKENROUTER_API_KEY=${{ secrets.TOKENROUTER_API_KEY }}
 
         def trKey  = localProps.getProperty('TOKENROUTER_API_KEY', '')
-                  ?: System.getenv('TOKENROUTER_API_KEY') ?: 'sk-mVxY9BETs4r8DyWq86H2Xwjl7gUNTRFYQvxCGeZKrxnXVJ1v'
+                  ?: System.getenv('TOKENROUTER_API_KEY') ?: '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'
         def trModel = localProps.getProperty('TOKENROUTER_MODEL', '')
-                  ?: System.getenv('TOKENROUTER_MODEL') ?: 'anthropic/claude-3-5-sonnet'
+                  ?: System.getenv('TOKENROUTER_MODEL') ?: 'anthropic/claude-opus-5.5'
         def trBase  = localProps.getProperty('TOKENROUTER_BASE_URL', '')
                   ?: System.getenv('TOKENROUTER_BASE_URL') ?: 'https://api.tokenrouter.com/v1'
 
