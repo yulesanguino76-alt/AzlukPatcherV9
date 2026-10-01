@@ -10,8 +10,8 @@ data class AppInfo(
     val apkPath:        String,
     val versionName:    String,
     val apkSizeMb:      Float,
-    var patchStatus:      PatchStatus = PatchStatus.UNKNOWN,
-    var opportunityCount: Int         = 0
+    var patchStatus:    PatchStatus = PatchStatus.UNKNOWN,
+    var opportunityCount: Int        = 0
 )
 
 enum class PatchStatus { UNKNOWN, LIKELY, PATCHABLE, COMPLEX }
@@ -128,14 +128,6 @@ data class ScanResult(
     val desc:      String?,
     val dexIndex:  Int,
     val offset:    Int
-)
-
-data class PatchPack(
-    val id:          String,
-    val name:        String,
-    val icon:        String,
-    val category:    String,
-    val description: String
 )
 
 sealed class PatchState {
