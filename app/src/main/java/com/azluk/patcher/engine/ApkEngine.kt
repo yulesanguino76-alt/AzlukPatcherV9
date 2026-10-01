@@ -48,6 +48,10 @@ import java.util.zip.ZipOutputStream
  * full split set. Installing a lone base.apk as an update is rejected by
  * the package verifier (INSTALL_FAILED_VERIFICATION_FAILURE, missing
  * splits), so patch() emits a .apks container in that case.
+ *
+ * Config splits legitimately carry NO classes.dex — only resources and
+ * native libs. Staging a split therefore logs and proceeds; only the
+ * base APK is required to contain DEX.
  */
 class ApkEngine(
     private val ctx: Context
@@ -635,7 +639,13 @@ class ApkEngine(
         }
 
         if (result.none { it.name.endsWith(".dex", true) }) {
-            throw IOException("APK contains no DEX files")
+            /*
+             * Config splits (base__abi, base__density, ...) legitimately
+             * carry no classes.dex — only resources and native libs.
+             * Failing here killed split-aware patching. Log and proceed:
+             * transformEntries() no-ops cleanly on an empty DEX list.
+             */
+            emit(progress, "  no DEX entries — resource-only split")
         }
 
         return result
