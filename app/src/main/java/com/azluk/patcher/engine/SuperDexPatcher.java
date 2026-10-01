@@ -3,7 +3,6 @@ package com.azluk.patcher.engine;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -19,33 +18,32 @@ import java.util.zip.Adler32;
  *
  * DEX parser/transformer, failure-loud by design:
  *
- *  - validates the DEX header before reading tables
- *  - uses the real DEX offsets from the specification
+ *  - validates the DEX header before reading tables (spec offsets:
+ *    string_ids @0x38/0x3C, class_defs @0x60/0x64)
+ *  - proto_id return_type_idx read at +4 (shorty @+0, return @+4,
+ *    parameters_off @+8) — the previous +8 read was the bug that made
+ *    every parameterized recipe silently miss
  *  - decodes DEX strings as strict MUTF-8
- *  - resolves methods structurally through class_defs -> class_data ->
- *    method_ids -> name_idx -> string_ids; never through const-string scans
- *  - never touches ACC_NATIVE or ACC_ABSTRACT methods
- *  - refuses methods with exception handlers (tries_size != 0)
- *  - recomputes SHA-1 + Adler32 only after successful mutation
+ *  - resolves methods structurally: class_defs -> class_data ->
+ *    method_ids -> name_idx -> string_ids. Never const-string scans.
+ *  - never touches ACC_NATIVE / ACC_ABSTRACT methods
+ *  - try/catch methods are stubbed HEAD-ONLY preserving instruction
+ *    boundaries (NOP fill to the first real boundary, stub at entry,
+ *    tail + try/handler tables byte-identical) — this is what unlocks
+ *    GMA's loadAd/show/initialize, always wrapped in try/catch
+ *  - stubs are verdict-aware: const/4 v0, #stubValue encoded as
+ *    format 11n with literal in bits 15-12 (0 == OK/false, 1 == true)
+ *  - caller-context recipes: boolean app methods that delegate their
+ *    verdict to java.security.Signature.verify(byte[]) are stubbed to
+ *    TRUE (SIGNATURE_BYPASS) — matched by exact method_id + invoke scan
+ *  - recomputes SHA-1 + Adler32 only after successful mutation, then
+ *    re-validates the output before returning it
  *
- * DETECTION has two layers, unioned:
- *
- *  1. Structural: exact descriptor presence in type_ids (DETECTORS map,
- *     built generically from RECIPES).
- *
- *  2. Marker scan (V8-compatible): UTF-8 byte substrings that only exist
- *     in a DEX when the corresponding SDK is linked in — class descriptors
- *     and well-known constant names live verbatim in the string pool.
- *     A marker hit means the patch is AVAILABLE, nothing more.
- *
- * PATCHING stays strict regardless of detection: every candidate is
- * re-verified structurally (exact descriptor + exact method + return
- * guard), and keys without a structural recipe no-op with a loud log
- * line — a detection hit can never corrupt a DEX.
- *
- * STUBS are type-aware AND verdict-aware: return-void, const/4 + return
- * for primitives (with a configurable stubValue — 0 == OK/SUCCESS/false,
- * 1 == true), null object returns, and zero wide returns.
+ * Detection = union of:
+ *   1. structural descriptor presence in type_ids (from RECIPES)
+ *   2. SDK marker substrings (V8-compatible badge layer)
+ * A detection hit means AVAILABLE. Keys without a safe structural
+ * recipe no-op with a loud log — detection can never corrupt a DEX.
  */
 public final class SuperDexPatcher {
 
@@ -82,116 +80,62 @@ public final class SuperDexPatcher {
         void log(String message);
     }
 
-    /**
-     * Marker table — V8-compatible detection layer.
-     *
-     * marker -> patch key. Markers are ASCII substrings of MUTF-8 DEX
-     * strings, so they appear verbatim as bytes in the file.
-     */
-    private static final String[][] MARKERS = {
-            /* Licensing */
-            { "LICENSE_BYPASS",      "ILicensingService" },
-            { "LICENSE_BYPASS",      "com/google/android/vending/licensing" },
-            { "LICENSE_BYPASS",      "LICENSED" },
+    // -------------------------------------------------------------------------
+    // Recipes — exact class descriptor + exact method + expected return
+    // -------------------------------------------------------------------------
 
-            /* Play Billing */
-            { "IAP_BYPASS",          "com/android/vending/billing" },
-            { "IAP_BYPASS",          "BillingClient" },
-            { "IAP_BYPASS",          "PURCHASED" },
-
-            /* Signature checks */
-            { "SIGNATURE_BYPASS",    "getSignatures" },
-            { "SIGNATURE_BYPASS",    "GET_SIGNATURES" },
-            { "SIGNATURE_BYPASS",    "signingInfo" },
-
-            /* Ad SDKs */
-            { "REMOVE_ADS",          "com/google/android/gms/ads" },
-            { "REMOVE_ADS",          "com/facebook/ads" },
-            { "REMOVE_ADS",          "com/unity3d/ads" },
-            { "REMOVE_ADS",          "com/applovin" },
-            { "REMOVE_ADS",          "com/ironsource" },
-            { "REMOVE_ADS",          "com/mopub" },
-            { "REMOVE_ADS",          "com/chartboost" },
-            { "REMOVE_ADS",          "com/vungle" },
-            { "REMOVE_ADS",          "com/inmobi" },
-
-            /* TLS pinning / trust managers */
-            { "SSL_BYPASS",          "CertificatePinner" },
-            { "SSL_BYPASS",          "checkServerTrusted" },
-            { "SSL_BYPASS",          "checkClientTrusted" },
-            { "SSL_BYPASS",          "javax/net/ssl/X509TrustManager" },
-
-            /* Root detection */
-            { "ROOT_BYPASS",         "isRooted" },
-            { "ROOT_BYPASS",         "RootBeer" },
-            { "ROOT_BYPASS",         "isDeviceRooted" },
-            { "ROOT_BYPASS",         "/system/xbin/su" },
-
-            /* Integrity attestation */
-            { "SAFETYNET_BYPASS",    "SafetyNet" },
-            { "SAFETYNET_BYPASS",    "com/google/android/play/core/integrity" },
-
-            /* Anti-Frida / anti-Xposed */
-            { "FRIDA_BYPASS",        "frida" },
-            { "FRIDA_BYPASS",        "XposedBridge" },
-            { "FRIDA_BYPASS",        "tracerpid" },
-
-            /* Screenshot blocking */
-            { "DISABLE_FLAG_SECURE", "FLAG_SECURE" }
-    };
-
-    /**
-     * Structural recipes. Exact descriptor match, exact method name match,
-     * optional expected return type guard, configurable stub verdict.
-     * First matching recipe wins.
-     */
     private static final List<Recipe> RECIPES;
 
     static {
         List<Recipe> recipes = new ArrayList<>();
 
-        /* ── Analytics ─────────────────────────────────────────────────── */
-
+        /*
+         * Analytics.
+         */
         recipes.add(new Recipe(
                 "DISABLE_ANALYTICS",
                 new String[]{ "Lcom/google/firebase/analytics/FirebaseAnalytics;" },
                 new String[]{ "logEvent" },
-                "V"));
-
+                "V"
+        ));
         recipes.add(new Recipe(
                 "DISABLE_ANALYTICS",
                 new String[]{ "Lcom/mixpanel/android/mpmetrics/MixpanelAPI;" },
                 new String[]{ "track", "trackMap" },
-                "V"));
+                "V"
+        ));
 
-        /* ── Telemetry ─────────────────────────────────────────────────── */
-
+        /*
+         * Telemetry.
+         */
         recipes.add(new Recipe(
                 "REMOVE_TELEMETRY",
                 new String[]{ "Lio/sentry/Sentry;" },
                 new String[]{ "captureException", "captureMessage", "captureEvent" },
-                null));
-
+                null
+        ));
         recipes.add(new Recipe(
                 "REMOVE_TELEMETRY",
                 new String[]{ "Lcom/google/firebase/crashlytics/FirebaseCrashlytics;" },
                 new String[]{ "recordException", "log" },
-                "V"));
-
+                "V"
+        ));
         recipes.add(new Recipe(
                 "REMOVE_TELEMETRY",
                 new String[]{ "Lcom/bugsnag/android/Bugsnag;" },
                 new String[]{ "notify" },
-                null));
+                null
+        ));
 
-        /* ── Ads: legacy GMA SDK ───────────────────────────────────────── */
-
+        /*
+         * Ads — legacy GMA SDK.
+         */
         recipes.add(new Recipe(
                 "REMOVE_ADS",
                 new String[]{ "Lcom/google/android/gms/ads/AdView;" },
                 new String[]{ "loadAd" },
-                "V"));
-
+                "V"
+        ));
         recipes.add(new Recipe(
                 "REMOVE_ADS",
                 new String[]{
@@ -200,18 +144,18 @@ public final class SuperDexPatcher {
                         "Lcom/google/android/gms/ads/rewarded/RewardedAd;"
                 },
                 new String[]{ "show" },
-                "V"));
+                "V"
+        ));
 
         /*
-         * Ads: modern GMA SDK (v20+). The entry-point classes moved into
-         * subpackages — banner/, interstitial/, appopen/, rewarded/.
+         * Ads — modern GMA SDK (v20+): subpackaged entry points.
          */
         recipes.add(new Recipe(
                 "REMOVE_ADS",
                 new String[]{ "Lcom/google/android/gms/ads/banner/BannerView;" },
                 new String[]{ "loadAd" },
-                "V"));
-
+                "V"
+        ));
         recipes.add(new Recipe(
                 "REMOVE_ADS",
                 new String[]{
@@ -220,10 +164,50 @@ public final class SuperDexPatcher {
                         "Lcom/google/android/gms/ads/appopen/AppOpenAd;"
                 },
                 new String[]{ "show" },
-                "V"));
+                "V"
+        ));
 
-        /* ── Ads: Facebook / Unity / AppLovin / IronSource / MoPub ─────── */
+        /*
+         * Ads — GMA v20+ LOAD side. Banners/natives load through AdLoader,
+         * interstitial/rewarded/appopen are acquired through static load().
+         * Stubbing only show() left the ad LOADED in memory — and visible.
+         */
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
+                new String[]{ "Lcom/google/android/gms/ads/AdLoader;" },
+                new String[]{ "loadAd" },
+                "V"
+        ));
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
+                new String[]{
+                        "Lcom/google/android/gms/ads/interstitial/InterstitialAd;",
+                        "Lcom/google/android/gms/ads/rewarded/RewardedAd;",
+                        "Lcom/google/android/gms/ads/appopen/AppOpenAd;"
+                },
+                new String[]{ "load" },
+                "V"
+        ));
 
+        /*
+         * Ads — SDK bootstrap. The SDK never starts.
+         */
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
+                new String[]{ "Lcom/google/android/gms/ads/MobileAds;" },
+                new String[]{ "initialize" },
+                "V"
+        ));
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
+                new String[]{ "Lcom/applovin/sdk/AppLovinSdk;" },
+                new String[]{ "initializeSdk" },
+                "V"
+        ));
+
+        /*
+         * Ads — Facebook / Unity / AppLovin / IronSource / MoPub.
+         */
         recipes.add(new Recipe(
                 "REMOVE_ADS",
                 new String[]{
@@ -231,8 +215,8 @@ public final class SuperDexPatcher {
                         "Lcom/facebook/ads/BannerAdView;"
                 },
                 new String[]{ "loadAd" },
-                "V"));
-
+                "V"
+        ));
         recipes.add(new Recipe(
                 "REMOVE_ADS",
                 new String[]{
@@ -241,14 +225,14 @@ public final class SuperDexPatcher {
                         "Lcom/facebook/ads/RewardedAd;"
                 },
                 new String[]{ "show", "loadAd" },
-                "V"));
-
+                "V"
+        ));
         recipes.add(new Recipe(
                 "REMOVE_ADS",
                 new String[]{ "Lcom/unity3d/ads/UnityAds;" },
                 new String[]{ "show", "load" },
-                "V"));
-
+                "V"
+        ));
         recipes.add(new Recipe(
                 "REMOVE_ADS",
                 new String[]{
@@ -257,14 +241,14 @@ public final class SuperDexPatcher {
                         "Lcom/applovin/mediation/ads/MaxAdView;"
                 },
                 new String[]{ "showAd", "show", "loadAd", "load" },
-                "V"));
-
+                "V"
+        ));
         recipes.add(new Recipe(
                 "REMOVE_ADS",
                 new String[]{ "Lcom/ironsource/mediationsdk/IronSource;" },
                 new String[]{ "showInterstitial", "showRewardedVideo" },
-                "V"));
-
+                "V"
+        ));
         recipes.add(new Recipe(
                 "REMOVE_ADS",
                 new String[]{
@@ -272,10 +256,12 @@ public final class SuperDexPatcher {
                         "Lcom/mopub/mobileads/MoPubInterstitial;"
                 },
                 new String[]{ "loadAd", "show" },
-                "V"));
+                "V"
+        ));
 
-        /* ── Ads: Vungle / InMobi / Chartboost ─────────────────────────── */
-
+        /*
+         * Ads — Vungle / InMobi / Chartboost.
+         */
         recipes.add(new Recipe(
                 "REMOVE_ADS",
                 new String[]{
@@ -283,8 +269,8 @@ public final class SuperDexPatcher {
                         "Lcom/vungle/ads/InterstitialAd;"
                 },
                 new String[]{ "playAd", "show", "load" },
-                "V"));
-
+                "V"
+        ));
         recipes.add(new Recipe(
                 "REMOVE_ADS",
                 new String[]{
@@ -292,39 +278,39 @@ public final class SuperDexPatcher {
                         "Lcom/inmobi/ads/InMobiInterstitial;"
                 },
                 new String[]{ "load", "show" },
-                "V"));
-
+                "V"
+        ));
         recipes.add(new Recipe(
                 "REMOVE_ADS",
                 new String[]{ "Lcom/chartboost/sdk/Chartboost;" },
                 new String[]{ "showInterstitial", "showRewardedVideo" },
-                "V"));
+                "V"
+        ));
 
         /*
-         * SSL pinning bypass (structural stubs).
-         *
-         *  - CertificatePinner.check -> void: pin verification no-ops.
-         *  - OkHostnameVerifier.verify -> boolean TRUE (stubValue=1):
-         *    hostname verification always passes. The value matters —
-         *    stubbing it to false would reject every TLS handshake.
+         * SSL pinning bypass. stubValue matters:
+         *   - CertificatePinner.check -> void: pin verification no-ops.
+         *   - OkHostnameVerifier.verify -> TRUE (stubValue=1): hostname
+         *     verification passes. Stubbing FALSE would reject every
+         *     TLS handshake and break the app outright.
          */
         recipes.add(new Recipe(
                 "SSL_BYPASS",
                 new String[]{ "Lokhttp3/CertificatePinner;" },
                 new String[]{ "check" },
                 "V",
-                0));
-
+                0
+        ));
         recipes.add(new Recipe(
                 "SSL_BYPASS",
                 new String[]{ "Lokhttp3/internal/tls/OkHostnameVerifier;" },
                 new String[]{ "verify" },
                 "Z",
-                1));
+                1
+        ));
 
         /*
-         * Root detection bypass — every verdict method stubbed to
-         * boolean FALSE (stubValue=0) = "not rooted".
+         * Root detection — every verdict stubbed FALSE (0) = "not rooted".
          */
         recipes.add(new Recipe(
                 "ROOT_BYPASS",
@@ -339,54 +325,55 @@ public final class SuperDexPatcher {
                         "checkForBusyBoxBinary"
                 },
                 "Z",
-                0));
+                0
+        ));
 
         /*
-         * LICENSE_BYPASS — Play License Verification (LVL).
-         * checkAccess/verify are the two classic nullification points:
-         * void stubs mean the verdict callback never fires a denial.
+         * LICENSE_BYPASS — Play LVL. Void stubs on the classic
+         * nullification points: the denial callback never fires.
          */
         recipes.add(new Recipe(
                 "LICENSE_BYPASS",
                 new String[]{ "Lcom/google/android/vending/licensing/LicenseChecker;" },
                 new String[]{ "checkAccess" },
-                "V"));
-
+                "V"
+        ));
         recipes.add(new Recipe(
                 "LICENSE_BYPASS",
                 new String[]{ "Lcom/google/android/vending/licensing/LicenseValidator;" },
                 new String[]{ "verify" },
-                "V"));
+                "V"
+        ));
 
         /*
-         * IAP_BYPASS — Play Billing. The stub returns 0, which IS
-         * BillingResponseCode.OK / BILLING_RESPONSE_RESULT_OK, so the
-         * int stub is semantically the bypass verdict itself.
+         * IAP_BYPASS — the stub returns 0, which IS
+         * BillingResponseCode.OK / BILLING_RESPONSE_RESULT_OK.
          */
         recipes.add(new Recipe(
                 "IAP_BYPASS",
                 new String[]{ "Lcom/android/billingclient/api/BillingResult;" },
                 new String[]{ "getResponseCode" },
                 "I",
-                0));
-
+                0
+        ));
         recipes.add(new Recipe(
                 "IAP_BYPASS",
                 new String[]{ "Lcom/android/billingclient/api/Purchase$PurchasesResult;" },
                 new String[]{ "getResponseCode" },
                 "I",
-                0));
-
+                0
+        ));
         recipes.add(new Recipe(
                 "IAP_BYPASS",
                 new String[]{ "Lcom/android/vending/billing/IInAppBillingService$Stub$Proxy;" },
                 new String[]{ "isBillingSupported", "isBillingSupportedExtraParams" },
                 "I",
-                0));
+                0
+        ));
 
         /*
          * GOOGLE_PLAY_BYPASS — availability gates. 0 == ConnectionResult
-         * .SUCCESS, so the int stub reports Play Services as available.
+         * .SUCCESS: Play Services reported as available.
          */
         recipes.add(new Recipe(
                 "GOOGLE_PLAY_BYPASS",
@@ -397,13 +384,38 @@ public final class SuperDexPatcher {
                 },
                 new String[]{ "isGooglePlayServicesAvailable" },
                 "I",
-                0));
+                0
+        ));
 
         RECIPES = Collections.unmodifiableList(recipes);
     }
 
     /**
-     * Exact-descriptor detectors, built generically from RECIPES.
+     * Caller-context recipes: instead of synthesizing receipts, stub the
+     * APP-LEVEL method that delegates its verdict to a framework verifier.
+     * A boolean/void method whose body invokes the target is a local
+     * verdict method (receipt checks, license checks, update checks).
+     * Match: exact method_id (class + name), then an invoke-site scan of
+     * candidate bodies. Boolean verdicts stub to TRUE.
+     */
+    private static final Map<String, String[][]> CALLER_TARGETS;
+
+    static {
+        Map<String, String[][]> callerTargets = new HashMap<>();
+
+        callerTargets.put(
+                "SIGNATURE_BYPASS",
+                new String[][]{
+                        { "Ljava/security/Signature;", "verify" }
+                }
+        );
+
+        CALLER_TARGETS = Collections.unmodifiableMap(callerTargets);
+    }
+
+    /**
+     * Structural detectors, built generically from RECIPES so every
+     * recipe key is auto-detected by exact descriptor presence.
      */
     private static final Map<String, List<String>> DETECTORS;
 
@@ -412,28 +424,78 @@ public final class SuperDexPatcher {
 
         for (Recipe recipe : RECIPES) {
             List<String> classes = detectors.get(recipe.key);
-
             if (classes == null) {
                 classes = new ArrayList<>();
                 detectors.put(recipe.key, classes);
             }
-
             Collections.addAll(classes, recipe.classes);
         }
 
         DETECTORS = Collections.unmodifiableMap(detectors);
     }
 
+    /**
+     * Marker layer (V8-compatible): UTF-8 substrings that only exist in
+     * a DEX when the corresponding SDK is linked in. A hit means the
+     * patch is AVAILABLE — nothing more.
+     */
+    private static final String[][] MARKERS = {
+            /* Licensing */
+            { "LICENSE_BYPASS", "ILicensingService" },
+            { "LICENSE_BYPASS", "com/google/android/vending/licensing" },
+            { "LICENSE_BYPASS", "LICENSED" },
+            /* Play Billing */
+            { "IAP_BYPASS", "com/android/vending/billing" },
+            { "IAP_BYPASS", "BillingClient" },
+            { "IAP_BYPASS", "PURCHASED" },
+            /* Signature checks */
+            { "SIGNATURE_BYPASS", "getSignatures" },
+            { "SIGNATURE_BYPASS", "GET_SIGNATURES" },
+            { "SIGNATURE_BYPASS", "signingInfo" },
+            /* Ad SDKs */
+            { "REMOVE_ADS", "com/google/android/gms/ads" },
+            { "REMOVE_ADS", "com/facebook/ads" },
+            { "REMOVE_ADS", "com/unity3d/ads" },
+            { "REMOVE_ADS", "com/applovin" },
+            { "REMOVE_ADS", "com/ironsource" },
+            { "REMOVE_ADS", "com/mopub" },
+            { "REMOVE_ADS", "com/chartboost" },
+            { "REMOVE_ADS", "com/vungle" },
+            { "REMOVE_ADS", "com/inmobi" },
+            { "REMOVE_ADS", "com/mbridge" },
+            { "REMOVE_ADS", "com/tapjoy" },
+            { "REMOVE_ADS", "com/startapp" },
+            { "REMOVE_ADS", "com/adcolony" },
+            /* TLS pinning / trust managers */
+            { "SSL_BYPASS", "CertificatePinner" },
+            { "SSL_BYPASS", "checkServerTrusted" },
+            { "SSL_BYPASS", "checkClientTrusted" },
+            { "SSL_BYPASS", "javax/net/ssl/X509TrustManager" },
+            /* Root detection */
+            { "ROOT_BYPASS", "isRooted" },
+            { "ROOT_BYPASS", "RootBeer" },
+            { "ROOT_BYPASS", "isDeviceRooted" },
+            { "ROOT_BYPASS", "/system/xbin/su" },
+            /* Integrity attestation */
+            { "SAFETYNET_BYPASS", "SafetyNet" },
+            { "SAFETYNET_BYPASS", "com/google/android/play/core/integrity" },
+            /* Anti-Frida / anti-Xposed */
+            { "FRIDA_BYPASS", "frida" },
+            { "FRIDA_BYPASS", "XposedBridge" },
+            { "FRIDA_BYPASS", "tracerpid" },
+            /* Emulator detection SDKs */
+            { "EMULATOR_BYPASS", "qemu" },
+            { "EMULATOR_BYPASS", "goldfish" },
+            /* Screenshot blocking */
+            { "DISABLE_FLAG_SECURE", "FLAG_SECURE" }
+    };
+
     // -------------------------------------------------------------------------
-    // Public API
+    // Public DEX API
     // -------------------------------------------------------------------------
 
     /**
-     * Parses and transforms a DEX.
-     *
-     * No silent fallback is performed. Every rejected transformation is an
-     * exception; a method that cannot be proven safe is left untouched and
-     * reported.
+     * Parses and transforms a DEX. No silent fallback is performed.
      */
     public static byte[] patch(
             byte[] dex,
@@ -452,7 +514,7 @@ public final class SuperDexPatcher {
 
         if (patchKeys == null || patchKeys.isEmpty()) {
             /*
-             * A no-op still validates. Silence must not hide malformed data.
+             * Still validate: a no-op must not hide malformed DEX data.
              */
             new DexFile(dex).validate();
             return dex.clone();
@@ -472,6 +534,7 @@ public final class SuperDexPatcher {
         log(progress, "  class_defs_size=" + file.classDefsSize);
 
         int patched = patchMethods(file, out, patchKeys, progress);
+        patched += patchCallerVerdicts(file, out, patchKeys, progress);
 
         if (patched == 0) {
             log(progress, "  no structural recipe matched");
@@ -481,9 +544,8 @@ public final class SuperDexPatcher {
         recomputeChecksums(out);
 
         /*
-         * Re-parse the mutated result. Offsets and sizes are unchanged by
-         * construction, but this catches any accidental structural damage
-         * before the caller ever sees the bytes.
+         * Re-parse the result: catches accidental structural corruption
+         * before the caller receives the bytes.
          */
         new DexFile(out).validate();
 
@@ -494,12 +556,680 @@ public final class SuperDexPatcher {
     }
 
     /**
-     * Conservative binary XML manifest transformer.
-     *
-     * Parses string pool, resource map and START_ELEMENT chunks, resolves
-     * attribute names to resource IDs through the resource map, and touches
-     * only requested attributes. No stride scans, no blind writes.
+     * Structural scan: union of type_ids descriptors and marker
+     * substrings. Used by ApkEngine for availability badges.
      */
+    public static Set<String> scanKeys(byte[] dex) {
+        DexFile file = new DexFile(dex);
+        file.validate();
+
+        Set<String> keys = new HashSet<>();
+
+        for (Recipe recipe : RECIPES) {
+            if (containsRecipeTarget(file, recipe)) {
+                keys.add(recipe.key);
+            }
+        }
+
+        keys.addAll(scanMarkers(dex));
+
+        return keys;
+    }
+
+    public static Set<String> scanMarkers(byte[] data) {
+        Set<String> keys = new HashSet<>();
+
+        for (String[] marker : MARKERS) {
+            if (containsBytes(data, marker[1].getBytes(
+                    java.nio.charset.StandardCharsets.UTF_8))) {
+                keys.add(marker[0]);
+            }
+        }
+
+        return keys;
+    }
+
+    public static List<String[]> quickScan(InputStream input) throws IOException {
+        byte[] data = readAll(input);
+
+        Set<String> keys = scanKeys(data);
+
+        List<String[]> result = new ArrayList<>();
+
+        for (String key : keys) {
+            result.add(new String[]{
+                    key,
+                    describeKey(key)
+            });
+        }
+
+        return result;
+    }
+
+    private static String describeKey(String key) {
+        switch (key) {
+            case "REMOVE_ADS":
+                return "Ad SDK entry points detected";
+            case "DISABLE_ANALYTICS":
+                return "Analytics SDK detected";
+            case "REMOVE_TELEMETRY":
+                return "Telemetry SDK detected";
+            case "SSL_BYPASS":
+                return "TLS pinning / trust manager detected";
+            case "ROOT_BYPASS":
+                return "Root detection detected";
+            case "SAFETYNET_BYPASS":
+                return "Integrity attestation detected";
+            case "FRIDA_BYPASS":
+                return "Frida / Xposed detection detected";
+            case "EMULATOR_BYPASS":
+                return "Emulator detection detected";
+            case "LICENSE_BYPASS":
+                return "Play Licensing detected";
+            case "IAP_BYPASS":
+                return "Play Billing detected";
+            case "SIGNATURE_BYPASS":
+                return "Signature check detected";
+            case "GOOGLE_PLAY_BYPASS":
+                return "Play Services availability gate detected";
+            case "DISABLE_FLAG_SECURE":
+                return "FLAG_SECURE usage detected";
+            default:
+                return "Detected";
+        }
+    }
+
+    /**
+     * Compat entry point. Domain blocking requires string-pool
+     * relocation; the old destructive "blank the string" behavior is
+     * deliberately not performed. Validates and returns a clean copy.
+     */
+    public static byte[] applyAdsDomainBlock(
+            byte[] dex,
+            List<String> domains
+    ) {
+        if (dex == null) {
+            throw new IllegalArgumentException("DEX is null");
+        }
+
+        new DexFile(dex).validate();
+        return dex.clone();
+    }
+
+    public static void recomputeChecksums(byte[] dex) {
+        if (dex.length < HEADER_SIZE) {
+            throw new IllegalArgumentException("DEX too small");
+        }
+
+        try {
+            MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
+
+            sha1.update(dex, 32, dex.length - 32);
+
+            byte[] digest = sha1.digest();
+
+            System.arraycopy(digest, 0, dex, 12, digest.length);
+
+                        Adler32 adler = new Adler32();
+
+            adler.update(dex, 12, dex.length - 12);
+
+            writeU32(dex, 8, (int) adler.getValue());
+        } catch (Exception e) {
+            throw new IllegalArgumentException(
+                    "Checksum recomputation failed: " + e.getMessage(), e
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // DEX method patching
+    // -------------------------------------------------------------------------
+
+    private static int patchMethods(
+            DexFile file,
+            byte[] out,
+            Set<String> patchKeys,
+            Progress progress
+    ) {
+        int patched = 0;
+
+        for (int classIndex = 0; classIndex < file.classDefsSize; classIndex++) {
+            int classDef = file.classDefsOff + classIndex * CLASS_DEF_SIZE;
+
+            int classTypeIndex = file.readU32(classDef);
+
+            String classDescriptor = file.getTypeDescriptor(classTypeIndex);
+
+            int classDataOff = file.readU32(classDef + 24);
+
+            if (classDataOff == 0) {
+                continue;
+            }
+
+            checkRange(classDataOff, 1, out.length, "class_data");
+
+            ClassData data = parseClassData(file, out, classDataOff);
+
+            for (EncodedMethod method : data.methods) {
+                if ((method.accessFlags & (ACC_NATIVE | ACC_ABSTRACT)) != 0) {
+                    continue;
+                }
+
+                if (method.codeOffset == 0) {
+                    continue;
+                }
+
+                if ((method.codeOffset & 3) != 0) {
+                    throw new IllegalArgumentException(
+                            "code_item offset is not 4-byte aligned: 0x" +
+                                    Integer.toHexString(method.codeOffset) +
+                                    " in " + classDescriptor
+                    );
+                }
+
+                MethodInfo info = file.getMethodInfo(method.methodIndex);
+
+                Recipe recipe = findRecipe(patchKeys, classDescriptor, info.name);
+
+                if (recipe == null) {
+                    continue;
+                }
+
+                if (recipe.expectedReturnType != null &&
+                        !recipe.expectedReturnType.equals(info.returnDescriptor)) {
+                    continue;
+                }
+
+                CodeItem code = CodeItem.parse(out, method.codeOffset);
+
+                int requiredUnits = requiredCodeUnits(info.returnDescriptor);
+
+                boolean wide =
+                        "J".equals(info.returnDescriptor) ||
+                                "D".equals(info.returnDescriptor);
+
+                int minRegisters =
+                        wide ? 2 : ("V".equals(info.returnDescriptor) ? 0 : 1);
+
+                if (code.registersSize < minRegisters) {
+                    log(progress, "  skip " + classDescriptor + "->" +
+                            info.name + ": insufficient registers");
+                    continue;
+                }
+
+                if (code.triesSize != 0) {
+                    /*
+                     * try/catch methods are stubbed HEAD-ONLY, preserving
+                     * instruction boundaries: NOP up to the first real
+                     * boundary at-or-after the stub length, stub at entry,
+                     * tail + try/handler tables byte-identical. This is
+                     * what unlocks GMA's loadAd/show/initialize, which are
+                     * always wrapped in try/catch.
+                     */
+                    int boundary = firstInstructionBoundary(
+                            out, code.insnsOffset, code.insnsSize, requiredUnits
+                    );
+
+                    if (boundary < 0) {
+                        log(progress, "  skip " + classDescriptor + "->" +
+                                info.name + ": no safe stub boundary (try/catch)");
+                        continue;
+                    }
+
+                    for (int u = 0; u < boundary; u++) {
+                        writeU16(out, code.insnsOffset + u * 2, 0x0000);
+                    }
+
+                    emitReturnStub(
+                            out, code.insnsOffset, boundary,
+                            code.registersSize, info.returnDescriptor,
+                            recipe.stubValue
+                    );
+
+                    patched++;
+                    log(progress, "  patched " + classDescriptor + "->" +
+                            info.name + " " + info.returnDescriptor +
+                            " (try/catch kept)");
+                    continue;
+                }
+
+                if (code.insnsSize < requiredUnits) {
+                    log(progress, "  skip " + classDescriptor + "->" +
+                            info.name + ": insufficient insns_size");
+                    continue;
+                }
+
+                emitReturnStub(
+                        out, code.insnsOffset, code.insnsSize,
+                        code.registersSize, info.returnDescriptor,
+                        recipe.stubValue
+                );
+
+                patched++;
+                log(progress, "  patched " + classDescriptor + "->" +
+                        info.name + " " + info.returnDescriptor);
+            }
+        }
+
+        return patched;
+    }
+
+    // -------------------------------------------------------------------------
+    // Caller-context verdicts (SIGNATURE_BYPASS)
+    // -------------------------------------------------------------------------
+
+    private static int patchCallerVerdicts(
+            DexFile file,
+            byte[] out,
+            Set<String> patchKeys,
+            Progress progress
+    ) {
+        int patched = 0;
+
+        for (Map.Entry<String, String[][]> entry : CALLER_TARGETS.entrySet()) {
+            if (!patchKeys.contains(entry.getKey())) {
+                continue;
+            }
+
+            Set<Integer> targetMethodIds = new HashSet<>();
+
+            for (String[] target : entry.getValue()) {
+                targetMethodIds.addAll(
+                        findMethodIds(file, target[0], target[1])
+                );
+            }
+
+            if (targetMethodIds.isEmpty()) {
+                continue;
+            }
+
+            for (int classIndex = 0; classIndex < file.classDefsSize; classIndex++) {
+                int classDef = file.classDefsOff + classIndex * CLASS_DEF_SIZE;
+                int classTypeIndex = file.readU32(classDef);
+                String classDescriptor = file.getTypeDescriptor(classTypeIndex);
+
+                int classDataOff = file.readU32(classDef + 24);
+                if (classDataOff == 0) {
+                    continue;
+                }
+
+                checkRange(classDataOff, 1, out.length, "class_data");
+
+                ClassData data = parseClassData(file, out, classDataOff);
+
+                for (EncodedMethod method : data.methods) {
+                    if ((method.accessFlags & (ACC_NATIVE | ACC_ABSTRACT)) != 0) {
+                        continue;
+                    }
+                    if (method.codeOffset == 0 || (method.codeOffset & 3) != 0) {
+                        continue;
+                    }
+
+                    MethodInfo info = file.getMethodInfo(method.methodIndex);
+
+                    /*
+                     * Verdict stubs: boolean methods returning TRUE.
+                     */
+                    if (!"Z".equals(info.returnDescriptor)) {
+                        continue;
+                    }
+
+                    CodeItem code = CodeItem.parse(out, method.codeOffset);
+
+                    if (code.triesSize != 0) {
+                        continue;
+                    }
+
+                    if (!instructionsReferenceAny(out, code, targetMethodIds)) {
+                        continue;
+                    }
+
+                    if (code.registersSize < 1 || code.insnsSize < 2) {
+                        continue;
+                    }
+
+                    emitReturnStub(
+                            out, code.insnsOffset, code.insnsSize,
+                            code.registersSize, "Z", 1
+                    );
+
+                    patched++;
+                    log(progress, "  patched caller " + classDescriptor + "->" +
+                            info.name + " Z=1 (verdict method)");
+                }
+            }
+        }
+
+        return patched;
+    }
+
+    private static List<Integer> findMethodIds(
+            DexFile file,
+            String classDescriptor,
+            String methodName
+    ) {
+        List<Integer> result = new ArrayList<>();
+
+        for (int i = 0; i < file.methodIdsSize; i++) {
+            int offset = file.methodIdsOff + i * METHOD_ID_SIZE;
+
+            int classIndex = readU16(file.bytes, offset);
+
+            try {
+                String descriptor = file.getTypeDescriptor(classIndex);
+
+                if (!classDescriptor.equals(descriptor)) {
+                    continue;
+                }
+
+                int nameIndex = file.readU32(offset + 4);
+                String name = file.getString(nameIndex);
+
+                if (methodName.equals(name)) {
+                    result.add(i);
+                }
+            } catch (IllegalArgumentException malformed) {
+                /*
+                 * One malformed method_id must not abort the scan.
+                 */
+            }
+        }
+
+        return result;
+    }
+
+    private static boolean instructionsReferenceAny(
+            byte[] data,
+            CodeItem code,
+            Set<Integer> methodIds
+    ) {
+        for (int u = 0; u < code.insnsSize; u++) {
+            int op = readU16(data, code.insnsOffset + u * 2) & 0xff;
+
+            boolean invoke =
+                    (op >= 0x6e && op <= 0x72) ||
+                    (op >= 0x74 && op <= 0x78);
+
+            if (!invoke || u + 1 >= code.insnsSize) {
+                continue;
+            }
+
+            int target = readU16(data, code.insnsOffset + (u + 1) * 2);
+
+            if (methodIds.contains(target)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Structural detection helpers
+    // -------------------------------------------------------------------------
+
+    private static boolean containsRecipeTarget(DexFile file, Recipe recipe) {
+        for (int classIndex = 0; classIndex < file.classDefsSize; classIndex++) {
+            int classDef = file.classDefsOff + classIndex * CLASS_DEF_SIZE;
+            int typeIndex = file.readU32(classDef);
+
+            String descriptor = file.getTypeDescriptor(typeIndex);
+
+            if (!recipe.matchesClass(descriptor)) {
+                continue;
+            }
+
+            int classDataOff = file.readU32(classDef + 24);
+
+            if (classDataOff == 0) {
+                continue;
+            }
+
+            ClassData data = parseClassData(file, file.bytes, classDataOff);
+
+            for (EncodedMethod method : data.methods) {
+                MethodInfo info = file.getMethodInfo(method.methodIndex);
+
+                if (recipe.matchesMethod(info.name)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static Recipe findRecipe(
+            Set<String> patchKeys,
+            String classDescriptor,
+            String methodName
+    ) {
+        for (Recipe recipe : RECIPES) {
+            if (!patchKeys.contains(recipe.key)) {
+                continue;
+            }
+            if (!recipe.matchesClass(classDescriptor)) {
+                continue;
+            }
+            if (!recipe.matchesMethod(methodName)) {
+                continue;
+            }
+            return recipe;
+        }
+
+        return null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Method code generation
+    // -------------------------------------------------------------------------
+
+    private static int requiredCodeUnits(String returnType) {
+        if ("V".equals(returnType)) {
+            return 1;
+        }
+        if ("J".equals(returnType) || "D".equals(returnType)) {
+            return 3;
+        }
+        return 2;
+    }
+
+    private static void emitReturnStub(
+            byte[] data,
+            int offset,
+            int insnsSize,
+            int registersSize,
+            String returnType,
+            int stubValue
+    ) {
+        if (insnsSize <= 0) {
+            throw new IllegalArgumentException("Invalid zero-length method");
+        }
+
+        for (int i = 0; i < insnsSize * 2; i++) {
+            data[offset + i] = 0;
+        }
+
+        if ("V".equals(returnType)) {
+            writeU16(data, offset, 0x000e);
+            return;
+        }
+
+        if (registersSize == 0) {
+            throw new IllegalArgumentException(
+                    "Cannot synthesize non-void return without a register"
+            );
+        }
+
+        if ("J".equals(returnType) || "D".equals(returnType)) {
+            /*
+             * const-wide/16 v0, #0 ; return-wide v0
+             */
+            writeU16(data, offset, 0x0016);
+            writeU16(data, offset + 2, 0x0000);
+            writeU16(data, offset + 4, 0x0010);
+            return;
+        }
+
+        /*
+         * const/4 v0, #stubValue — format 11n: bits 7-0 opcode,
+         * bits 11-8 register A (0), bits 15-12 signed literal B.
+         * stubValue IS the verdict (0 = OK/false, 1 = true).
+         * return v0 => 0x000f, return-object v0 => 0x0011.
+         */
+        writeU16(data, offset, 0x0012 | ((stubValue & 0xF) << 12));
+        writeU16(data, offset + 2, 0x000f);
+
+        if (returnType.startsWith("L") || returnType.startsWith("[")) {
+            writeU16(data, offset + 2, 0x0011);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Instruction boundary walk (head-only stubbing of try/catch methods)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Size of every Dalvik opcode in 16-bit code units.
+     * 0 = unknown or unusable: the walk bails out instead of guessing.
+     */
+    private static final int[] OPCODE_UNITS = buildOpcodeUnits();
+
+    private static int[] buildOpcodeUnits() {
+        int[] t = new int[256];
+
+        t[0x00] = 1;
+        t[0x01] = 1; t[0x02] = 2; t[0x03] = 3;
+        t[0x04] = 1; t[0x05] = 2; t[0x06] = 3;
+        t[0x07] = 1; t[0x08] = 2; t[0x09] = 3;
+        t[0x0a] = 1; t[0x0b] = 1; t[0x0c] = 1; t[0x0d] = 1;
+        t[0x0e] = 1; t[0x0f] = 1; t[0x10] = 1; t[0x11] = 1;
+        t[0x12] = 1; t[0x13] = 2; t[0x14] = 3; t[0x15] = 2;
+        t[0x16] = 2; t[0x17] = 3; t[0x18] = 5; t[0x19] = 2;
+        t[0x1a] = 2; t[0x1b] = 3; t[0x1c] = 2;
+        t[0x1d] = 1; t[0x1e] = 1; t[0x1f] = 2; t[0x20] = 2;
+        t[0x21] = 1; t[0x22] = 2; t[0x23] = 2; t[0x24] = 3;
+        t[0x25] = 3; t[0x26] = 3; t[0x27] = 1;
+        t[0x28] = 1; t[0x29] = 2; t[0x2a] = 3;
+        t[0x2b] = 3; t[0x2c] = 3;
+
+        for (int op = 0x2d; op <= 0x31; op++) t[op] = 2;
+        for (int op = 0x32; op <= 0x37; op++) t[op] = 2;
+        for (int op = 0x38; op <= 0x3d; op++) t[op] = 2;
+        for (int op = 0x44; op <= 0x51; op++) t[op] = 2;
+        for (int op = 0x52; op <= 0x5f; op++) t[op] = 2;
+        for (int op = 0x60; op <= 0x6d; op++) t[op] = 2;
+        for (int op = 0x6e; op <= 0x72; op++) t[op] = 3;
+        for (int op = 0x74; op <= 0x78; op++) t[op] = 3;
+        for (int op = 0x7b; op <= 0x8f; op++) t[op] = 1;
+        for (int op = 0x90; op <= 0xaf; op++) t[op] = 2;
+        for (int op = 0xb0; op <= 0xcf; op++) t[op] = 1;
+        for (int op = 0xd0; op <= 0xd7; op++) t[op] = 2;
+        for (int op = 0xd8; op <= 0xe2; op++) t[op] = 2;
+
+        t[0xfa] = 4; t[0xfb] = 4;
+        t[0xfc] = 3; t[0xfd] = 3;
+        t[0xfe] = 2; t[0xff] = 2;
+
+        return t;
+    }
+
+    /**
+     * First instruction boundary (in code units, relative to insns start)
+     * at or after minUnits, walking real instruction sizes.
+     * -1 = cannot establish a safe boundary.
+     */
+    private static int firstInstructionBoundary(
+            byte[] data,
+            int insnsOffset,
+            int insnsSize,
+            int minUnits
+    ) {
+        int unit = 0;
+
+        while (unit < minUnits) {
+            if (unit >= insnsSize) {
+                return -1;
+            }
+
+            int op = readU16(data, insnsOffset + unit * 2) & 0xff;
+
+            int size = OPCODE_UNITS[op];
+
+            if (size <= 0 || unit + size > insnsSize) {
+                return -1;
+            }
+
+            unit += size;
+        }
+
+        return unit;
+    }
+
+    // -------------------------------------------------------------------------
+    // Class data
+    // -------------------------------------------------------------------------
+
+    private static ClassData parseClassData(
+            DexFile file,
+            byte[] data,
+            int offset
+    ) {
+        Cursor cursor = new Cursor(data, offset);
+
+        int staticFields = cursor.readUleb128();
+        int instanceFields = cursor.readUleb128();
+        int directMethods = cursor.readUleb128();
+        int virtualMethods = cursor.readUleb128();
+
+        for (int i = 0; i < staticFields; i++) {
+            cursor.readUleb128();
+            cursor.readUleb128();
+        }
+
+        for (int i = 0; i < instanceFields; i++) {
+            cursor.readUleb128();
+            cursor.readUleb128();
+        }
+
+        List<EncodedMethod> methods = new ArrayList<>();
+
+        int previousMethodIndex = 0;
+
+        for (int i = 0; i < directMethods; i++) {
+            int delta = cursor.readUleb128();
+            int accessFlags = cursor.readUleb128();
+            int codeOffset = cursor.readUleb128();
+
+            previousMethodIndex += delta;
+
+            methods.add(new EncodedMethod(
+                    previousMethodIndex, accessFlags, codeOffset
+            ));
+        }
+
+        previousMethodIndex = 0;
+
+        for (int i = 0; i < virtualMethods; i++) {
+            int delta = cursor.readUleb128();
+            int accessFlags = cursor.readUleb128();
+            int codeOffset = cursor.readUleb128();
+
+            previousMethodIndex += delta;
+
+            methods.add(new EncodedMethod(
+                    previousMethodIndex, accessFlags, codeOffset
+            ));
+        }
+
+        return new ClassData(methods);
+    }
+
+    // -------------------------------------------------------------------------
+    // Binary XML — manifest patching
+    // -------------------------------------------------------------------------
+
     public static byte[] patchManifest(
             byte[] manifest,
             Set<String> patchKeys
@@ -546,7 +1276,7 @@ public final class SuperDexPatcher {
                 );
             }
 
-            if (type == RES_STRING_POOL_TYPE) {
+            if (type == RES_STRING_POOL_TYPE && pool == null) {
                 pool = StringPool.parse(out, cursor);
             } else if (type == RES_XML_RESOURCE_MAP_TYPE) {
                 resourceMapOffset = cursor;
@@ -566,25 +1296,13 @@ public final class SuperDexPatcher {
         boolean changed = false;
 
         cursor = 0;
-
         while (cursor < out.length) {
-            if (cursor + 8 > out.length) {
-                throw new IllegalArgumentException(
-                        "Truncated AXML chunk header at " + cursor
-                );
-            }
-
             int type = readU16(out, cursor);
             int chunkSize = readU32Checked(out, cursor + 4);
 
             if (type == RES_XML_START_ELEMENT_TYPE) {
                 changed |= patchStartElement(
-                        out,
-                        cursor,
-                        chunkSize,
-                        pool,
-                        resourceMapOffset,
-                        patchKeys
+                        out, cursor, chunkSize, pool, resourceMapOffset, patchKeys
                 );
             }
 
@@ -592,155 +1310,6 @@ public final class SuperDexPatcher {
         }
 
         return changed ? out : manifest.clone();
-    }
-
-    /**
-     * Kept for source compatibility with the current ApkEngine.
-     */
-    public static byte[] applyAdsDomainBlock(
-            byte[] dex,
-            List<String> domains
-    ) {
-        if (dex == null) {
-            throw new IllegalArgumentException("DEX is null");
-        }
-
-        new DexFile(dex).validate();
-        return dex.clone();
-    }
-
-    // -------------------------------------------------------------------------
-    // Detection
-    // -------------------------------------------------------------------------
-
-    /**
-     * Layer 1: exact descriptor presence in type_ids.
-     * No substring matching, no byte scans.
-     */
-    public static Set<String> scanKeys(byte[] dex) {
-        DexFile file = new DexFile(dex);
-        file.validate();
-
-        Set<String> descriptors = new HashSet<>();
-
-        for (int i = 0; i < file.typeIdsSize; i++) {
-            descriptors.add(file.getTypeDescriptor(i));
-        }
-
-        Set<String> keys = new HashSet<>();
-
-        for (Map.Entry<String, List<String>> entry : DETECTORS.entrySet()) {
-            for (String cls : entry.getValue()) {
-                if (descriptors.contains(cls)) {
-                    keys.add(entry.getKey());
-                    break;
-                }
-            }
-        }
-
-        return keys;
-    }
-
-    /**
-     * Layer 2: V8-compatible marker scan.
-     *
-     * SDK marker substrings anywhere in the DEX bytes. A hit means the
-     * SDK is linked into the app and its patch is AVAILABLE — the patch
-     * phase re-verifies structurally, so this can never cause corruption.
-     */
-    public static Set<String> scanMarkers(byte[] data) {
-        Set<String> keys = new HashSet<>();
-
-        for (String[] marker : MARKERS) {
-            if (containsBytes(data, marker[1])) {
-                keys.add(marker[0]);
-            }
-        }
-
-        return keys;
-    }
-
-    private static boolean containsBytes(byte[] data, String needle) {
-        byte[] pattern =
-                needle.getBytes(StandardCharsets.US_ASCII);
-
-        if (pattern.length == 0 || data.length < pattern.length) {
-            return false;
-        }
-
-        byte first = pattern[0];
-        int last = data.length - pattern.length;
-
-        outer:
-        for (int i = 0; i <= last; i++) {
-            if (data[i] != first) {
-                continue;
-            }
-
-            for (int j = 1; j < pattern.length; j++) {
-                if (data[i + j] != pattern[j]) {
-                    continue outer;
-                }
-            }
-
-            return true;
-        }
-
-        return false;
-    }
-
-    public static List<String[]> quickScan(InputStream input) throws IOException {
-        byte[] data = readAll(input);
-
-        /*
-         * Union of both detection layers:
-         *   1. exact descriptor presence in type_ids (structural)
-         *   2. SDK marker substrings anywhere in the DEX (V8-compatible)
-         */
-        Set<String> keys = scanKeys(data);
-        keys.addAll(scanMarkers(data));
-
-        List<String[]> result = new ArrayList<>();
-
-        for (String key : keys) {
-            result.add(new String[]{
-                    key,
-                    describeKey(key)
-            });
-        }
-
-        return result;
-    }
-
-    private static String describeKey(String key) {
-        switch (key) {
-            case "REMOVE_ADS":
-                return "Ad SDK entry points detected";
-            case "DISABLE_ANALYTICS":
-                return "Analytics SDK detected";
-            case "REMOVE_TELEMETRY":
-                return "Telemetry SDK detected";
-            case "SSL_BYPASS":
-                return "TLS pinning / trust manager detected";
-            case "ROOT_BYPASS":
-                return "Root detection detected";
-            case "SAFETYNET_BYPASS":
-                return "Integrity attestation detected";
-            case "FRIDA_BYPASS":
-                return "Frida / Xposed detection detected";
-            case "LICENSE_BYPASS":
-                return "Play Licensing detected";
-            case "IAP_BYPASS":
-                return "Play Billing detected";
-            case "SIGNATURE_BYPASS":
-                return "Signature check detected";
-            case "GOOGLE_PLAY_BYPASS":
-                return "Play Services availability gate detected";
-            case "DISABLE_FLAG_SECURE":
-                return "FLAG_SECURE usage detected";
-            default:
-                return "Detected";
-        }
     }
 
     /**
@@ -786,453 +1355,98 @@ public final class SuperDexPatcher {
             return keys;
         }
 
-        Boolean debuggable = null;
-        Boolean allowBackup = null;
-        Boolean fullBackupOnly = null;
-        boolean exportedFalseFound = false;
-
         cursor = 0;
-
         while (cursor < manifest.length) {
             int type = readU16(manifest, cursor);
             int chunkSize = readU32Checked(manifest, cursor + 4);
 
-            if (type == RES_XML_START_ELEMENT_TYPE &&
-                    cursor + 36 <= manifest.length) {
-
-                int nodeHeaderSize = readU16(manifest, cursor + 2);
-
-                if (nodeHeaderSize >= 16 &&
-                        cursor + nodeHeaderSize + 20 <= manifest.length) {
-
-                    int ext = cursor + nodeHeaderSize;
-                    int attributeStart = readU16(manifest, ext + 8);
-                    int attributeSize = readU16(manifest, ext + 10);
-                    int attributeCount = readU16(manifest, ext + 12);
-
-                    if (attributeSize >= 20) {
-                        int base = ext + attributeStart;
-
-                        for (int i = 0; i < attributeCount; i++) {
-                            if ((long) base + (long) (i + 1) * attributeSize >
-                                    (long) cursor + chunkSize) {
-                                break;
-                            }
-
-                            int attr = base + i * attributeSize;
-                            int nameStringIndex =
-                                    readU32Checked(manifest, attr + 4);
-
-                            int resourceId = resolveResourceId(
-                                    manifest,
-                                    resourceMapOffset,
-                                    nameStringIndex
-                            );
-
-                            int dataType =
-                                    manifest[attr + 15] & 0xff;
-
-                            Boolean value = null;
-
-                            if (dataType == TYPE_INT_BOOLEAN) {
-                                value = readU32Checked(manifest, attr + 16) != 0;
-                            } else if (dataType == 0x03) {
-                                /*
-                                 * TYPE_STRING: compare the raw literal.
-                                 */
-                                String raw = poolString(
-                                        pool,
-                                        manifest,
-                                        readU32Checked(manifest, attr + 16)
-                                );
-
-                                if (raw != null) {
-                                    if ("true".equals(raw)) {
-                                        value = Boolean.TRUE;
-                                    } else if ("false".equals(raw)) {
-                                        value = Boolean.FALSE;
-                                    }
-                                }
-                            }
-
-                            if (value == null) {
-                                continue;
-                            }
-
-                            if (resourceId == ATTR_DEBUGGABLE) {
-                                debuggable = value;
-                            } else if (resourceId == ATTR_ALLOW_BACKUP) {
-                                allowBackup = value;
-                            } else if (resourceId == ATTR_FULL_BACKUP_ONLY) {
-                                fullBackupOnly = value;
-                            } else if (resourceId == ATTR_EXPORTED &&
-                                    !value.booleanValue()) {
-                                exportedFalseFound = true;
-                            }
-                        }
-                    }
-                }
+            if (type == RES_XML_START_ELEMENT_TYPE) {
+                scanStartElement(
+                        manifest, cursor, chunkSize,
+                        resourceMapOffset, keys
+                );
             }
 
             cursor += chunkSize;
         }
 
-        if (Boolean.FALSE.equals(debuggable)) {
-            keys.add("FORCE_DEBUGGABLE");
-        }
-
-        if (Boolean.FALSE.equals(allowBackup) ||
-                Boolean.TRUE.equals(fullBackupOnly)) {
-            keys.add("ALLOW_BACKUP");
-        }
-
-        if (exportedFalseFound) {
-            keys.add("EXPORT_ALL_COMPONENTS");
-        }
-
         return keys;
     }
 
-    private static String poolString(
-            StringPool pool,
+    private static void scanStartElement(
             byte[] data,
-            int index
+            int chunkOffset,
+            int chunkSize,
+            int resourceMapOffset,
+            Set<String> keys
     ) {
-        if (index < 0 || index >= pool.stringCount) {
-            return null;
-        }
-
-        int abs = pool.chunkOffset +
-                pool.stringsStart +
-                pool.offsets[index];
-
-        if (abs < 0 || abs + 2 > data.length) {
-            return null;
-        }
-
-        try {
-            if ((pool.flags & 0x100) != 0) {
-                /*
-                 * UTF-8 pool: MUTF-8 with ULEB128 length.
-                 */
-                return readMutf8(data, abs);
-            }
-
-            /*
-             * UTF-16LE pool: u16 length, chars, NUL.
-             */
-            int len = readU16(data, abs);
-
-            if (abs + 2 + len * 2 > data.length) {
-                return null;
-            }
-
-            StringBuilder out = new StringBuilder(len);
-
-            for (int i = 0; i < len; i++) {
-                out.append((char) readU16(data, abs + 2 + i * 2));
-            }
-
-            return out.toString();
-        } catch (RuntimeException e) {
-            return null;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // DEX method analysis
-    // -------------------------------------------------------------------------
-
-    private static int patchMethods(
-            DexFile file,
-            byte[] out,
-            Set<String> patchKeys,
-            Progress progress
-    ) {
-        int patched = 0;
-
-        for (int classIndex = 0; classIndex < file.classDefsSize; classIndex++) {
-            int classDef = file.classDefsOff + classIndex * CLASS_DEF_SIZE;
-            int classTypeIndex = file.readU32(classDef);
-            String classDescriptor = file.getTypeDescriptor(classTypeIndex);
-            int classDataOff = file.readU32(classDef + 24);
-
-            if (classDataOff == 0) {
-                continue;
-            }
-
-            checkRange(
-                    classDataOff,
-                    1,
-                    out.length,
-                    "class_data"
-            );
-
-            ClassData data = parseClassData(file, out, classDataOff);
-
-            for (EncodedMethod method : data.methods) {
-                if ((method.accessFlags & (ACC_NATIVE | ACC_ABSTRACT)) != 0) {
-                    /*
-                     * Native and abstract methods carry no code_item.
-                     * Touching them is always corruption.
-                     */
-                    continue;
-                }
-
-                if (method.codeOffset == 0) {
-                    continue;
-                }
-
-                if ((method.codeOffset & 3) != 0) {
-                    throw new IllegalArgumentException(
-                            "code_item offset is not 4-byte aligned: 0x" +
-                                    Integer.toHexString(method.codeOffset) +
-                                    " in " + classDescriptor
-                    );
-                }
-
-                MethodInfo info = file.getMethodInfo(method.methodIndex);
-
-                Recipe recipe = findRecipe(
-                        patchKeys,
-                        classDescriptor,
-                        info.name
-                );
-
-                if (recipe == null) {
-                    continue;
-                }
-
-                if (recipe.expectedReturnType != null &&
-                        !recipe.expectedReturnType.equals(info.returnDescriptor)) {
-                    continue;
-                }
-
-                CodeItem code = CodeItem.parse(out, method.codeOffset);
-
-                if (code.triesSize != 0) {
-                    /*
-                     * Replacing a method containing try/catch regions
-                     * without rebuilding the handler tables is unsafe.
-                     */
-                    log(
-                            progress,
-                            "  skip " + classDescriptor + "->" +
-                                    info.name + ": tries_size != 0"
-                    );
-                    continue;
-                }
-
-                int requiredUnits = requiredCodeUnits(info.returnDescriptor);
-
-                if (code.insnsSize < requiredUnits) {
-                    log(
-                            progress,
-                            "  skip " + classDescriptor + "->" +
-                                    info.name + ": insufficient insns_size"
-                    );
-                    continue;
-                }
-
-                emitReturnStub(
-                        out,
-                        code.insnsOffset,
-                        code.insnsSize,
-                        code.registersSize,
-                        info.returnDescriptor,
-                        recipe.stubValue
-                );
-
-                patched++;
-
-                log(
-                        progress,
-                        "  patched " +
-                                classDescriptor +
-                                "->" +
-                                info.name +
-                                " " +
-                                info.returnDescriptor
-                );
-            }
-        }
-
-        return patched;
-    }
-
-    private static Recipe findRecipe(
-            Set<String> patchKeys,
-            String classDescriptor,
-            String methodName
-    ) {
-        for (Recipe recipe : RECIPES) {
-            if (!patchKeys.contains(recipe.key)) {
-                continue;
-            }
-
-            if (!recipe.matchesClass(classDescriptor)) {
-                continue;
-            }
-
-            if (!recipe.matchesMethod(methodName)) {
-                continue;
-            }
-
-            return recipe;
-        }
-
-        return null;
-    }
-
-    // -------------------------------------------------------------------------
-    // Method code generation
-    // -------------------------------------------------------------------------
-
-    private static int requiredCodeUnits(String returnType) {
-        if ("V".equals(returnType)) {
-            return 1;
-        }
-
-        if ("J".equals(returnType) || "D".equals(returnType)) {
-            return 3;
-        }
-
-        return 2;
-    }
-
-    private static void emitReturnStub(
-            byte[] data,
-            int offset,
-            int insnsSize,
-            int registersSize,
-            String returnType,
-            int stubValue
-    ) {
-        if (insnsSize <= 0) {
-            throw new IllegalArgumentException("Invalid zero-length method");
-        }
-
-        /*
-         * Fill the entire instruction stream with NOP first so no dead
-         * original instructions survive behind the stub.
-         */
-        for (int i = 0; i < insnsSize * 2; i++) {
-            data[offset + i] = 0;
-        }
-
-        if ("V".equals(returnType)) {
-            /*
-             * return-void => 0x000e
-             */
-            writeU16(data, offset, 0x000e);
+        if (chunkOffset + 36 > data.length) {
             return;
         }
 
-        if ("J".equals(returnType) || "D".equals(returnType)) {
-            /*
-             * const-wide/16 v0, #0 => 0x0016, literal 0x0000
-             * return-wide v0 => 0x0010
-             */
-            if (registersSize < 2) {
-                throw new IllegalArgumentException(
-                        "Wide return requires 2 registers, method has " +
-                                registersSize
-                );
-            }
-
-            writeU16(data, offset, 0x0016);
-            writeU16(data, offset + 2, 0x0000);
-            writeU16(data, offset + 4, 0x0010);
+        int nodeHeaderSize = readU16(data, chunkOffset + 2);
+        if (nodeHeaderSize < 16) {
             return;
         }
 
-        if (registersSize < 1) {
-            throw new IllegalArgumentException(
-                    "Non-void return requires 1 register, method has " +
-                            registersSize
+        int ext = chunkOffset + nodeHeaderSize;
+        if (ext + 20 > data.length) {
+            return;
+        }
+
+        int attributeStart = readU16(data, ext + 8);
+        int attributeSize = readU16(data, ext + 10);
+        int attributeCount = readU16(data, ext + 12);
+
+        if (attributeSize < 20 || attributeCount <= 0) {
+            return;
+        }
+
+        int attributesBase = ext + attributeStart;
+
+        long end = (long) attributesBase +
+                (long) attributeCount * attributeSize;
+
+        if (attributesBase < 0 || end > chunkOffset + chunkSize ||
+                end > data.length) {
+            return;
+        }
+
+        for (int i = 0; i < attributeCount; i++) {
+            int attr = attributesBase + i * attributeSize;
+
+            int nameStringIndex = readU32(data, attr + 4);
+
+            int resourceId = resolveResourceId(
+                    data, resourceMapOffset, nameStringIndex
             );
-        }
 
-        /*
-         * const/4 v0, #literal — format 11n: opcode 0x12, register in A,
-         * 4-bit signed literal in B (bits 8-11). stubValue 0 or 1 fits.
-         * return v0 => 0x000f
-         * return-object v0 => 0x0011 (object/array returns: null)
-         */
-        writeU16(data, offset, 0x0012 | ((stubValue & 0xF) << 8));
-        writeU16(data, offset + 2, 0x000f);
+            int dataType = data[attr + 15] & 0xff;
+            int dataValue = readU32(data, attr + 16);
 
-        if (returnType.startsWith("L") || returnType.startsWith("[")) {
-            writeU16(data, offset + 2, 0x0011);
+            if (dataType != TYPE_INT_BOOLEAN) {
+                continue;
+            }
+
+            boolean current = dataValue != 0;
+
+            if (resourceId == ATTR_DEBUGGABLE && !current) {
+                keys.add("FORCE_DEBUGGABLE");
+            }
+
+            if (resourceId == ATTR_EXPORTED && !current) {
+                keys.add("EXPORT_ALL_COMPONENTS");
+            }
+
+            if (resourceId == ATTR_ALLOW_BACKUP && !current) {
+                keys.add("ALLOW_BACKUP");
+            }
+
+            if (resourceId == ATTR_FULL_BACKUP_ONLY && current) {
+                keys.add("ALLOW_BACKUP");
+            }
         }
     }
-
-    // -------------------------------------------------------------------------
-    // Class data
-    // -------------------------------------------------------------------------
-
-    private static ClassData parseClassData(
-            DexFile file,
-            byte[] data,
-            int offset
-    ) {
-        Cursor cursor = new Cursor(data, offset);
-
-        int staticFields = cursor.readUleb128();
-        int instanceFields = cursor.readUleb128();
-        int directMethods = cursor.readUleb128();
-        int virtualMethods = cursor.readUleb128();
-
-        for (int i = 0; i < staticFields; i++) {
-            cursor.readUleb128();
-            cursor.readUleb128();
-        }
-
-        for (int i = 0; i < instanceFields; i++) {
-            cursor.readUleb128();
-            cursor.readUleb128();
-        }
-
-        List<EncodedMethod> methods = new ArrayList<>();
-
-        int previousMethodIndex = 0;
-
-        for (int i = 0; i < directMethods; i++) {
-            int delta = cursor.readUleb128();
-            int accessFlags = cursor.readUleb128();
-            int codeOffset = cursor.readUleb128();
-
-            previousMethodIndex += delta;
-
-            methods.add(new EncodedMethod(
-                    previousMethodIndex,
-                    accessFlags,
-                    codeOffset
-            ));
-        }
-
-        previousMethodIndex = 0;
-
-        for (int i = 0; i < virtualMethods; i++) {
-            int delta = cursor.readUleb128();
-            int accessFlags = cursor.readUleb128();
-            int codeOffset = cursor.readUleb128();
-
-            previousMethodIndex += delta;
-
-            methods.add(new EncodedMethod(
-                    previousMethodIndex,
-                    accessFlags,
-                    codeOffset
-            ));
-        }
-
-        return new ClassData(methods);
-    }
-
-    // -------------------------------------------------------------------------
-    // Binary XML
-    // -------------------------------------------------------------------------
 
     private static boolean patchStartElement(
             byte[] data,
@@ -1242,28 +1456,6 @@ public final class SuperDexPatcher {
             int resourceMapOffset,
             Set<String> keys
     ) {
-        /*
-         * START_ELEMENT:
-         *
-         * ResXMLTree_node
-         *   type u16
-         *   headerSize u16
-         *   size u32
-         *   lineNumber u32
-         *   comment u32
-         *
-         * ResXMLTree_attrExt (at nodeHeaderSize)
-         *   ns u32
-         *   name u32
-         *   attributeStart u16
-         *   attributeSize u16
-         *   attributeCount u16
-         *   idIndex u16
-         *   classIndex u16
-         *   styleIndex u16
-         *
-         * followed by attributeCount ResXMLTree_attribute entries.
-         */
         if (chunkOffset + 36 > data.length) {
             throw new IllegalArgumentException("Truncated START_ELEMENT");
         }
@@ -1271,9 +1463,7 @@ public final class SuperDexPatcher {
         int nodeHeaderSize = readU16(data, chunkOffset + 2);
 
         if (nodeHeaderSize < 16) {
-            throw new IllegalArgumentException(
-                    "Invalid XML node header"
-            );
+            throw new IllegalArgumentException("Invalid XML node header");
         }
 
         int ext = chunkOffset + nodeHeaderSize;
@@ -1310,12 +1500,11 @@ public final class SuperDexPatcher {
 
         for (int i = 0; i < attributeCount; i++) {
             int attr = attributesBase + i * attributeSize;
-            int nameStringIndex = readU32Checked(data, attr + 4);
+
+            int nameStringIndex = readU32(data, attr + 4);
 
             int resourceId = resolveResourceId(
-                    data,
-                    resourceMapOffset,
-                    nameStringIndex
+                    data, resourceMapOffset, nameStringIndex
             );
 
             if (resourceId == ATTR_DEBUGGABLE &&
@@ -1351,30 +1540,16 @@ public final class SuperDexPatcher {
             int resourceMapOffset,
             int stringIndex
     ) {
-        if (stringIndex < 0) {
-            throw new IllegalArgumentException(
-                    "Negative attribute name index: " + stringIndex
-            );
-        }
-
         int headerSize = readU16(data, resourceMapOffset + 2);
-        int chunkSize = readU32Checked(data, resourceMapOffset + 4);
         int mapBase = resourceMapOffset + headerSize;
 
-        long entryEnd = (long) mapBase +
-                ((long) stringIndex + 1L) * 4L;
+        long offset = (long) mapBase + (long) stringIndex * 4L;
 
-        if (entryEnd > resourceMapOffset + chunkSize ||
-                entryEnd > data.length) {
-            /*
-             * This attribute name has no entry in the resource map —
-             * it carries no Android resource ID. Reporting 0 means
-             * "no match", which is correct, not an error.
-             */
+        if (offset < 0 || offset + 4 > data.length) {
             return 0;
         }
 
-        return readU32Checked(data, (int) (mapBase + (long) stringIndex * 4L));
+        return readU32Checked(data, (int) offset);
     }
 
     private static void writeBooleanValue(
@@ -1382,74 +1557,10 @@ public final class SuperDexPatcher {
             int attributeOffset,
             boolean value
     ) {
-        /*
-         * Attribute:
-         *   ns        +0
-         *   name      +4
-         *   rawValue  +8
-         *   typedValue +12
-         *
-         * typedValue (Res_value):
-         *   size     +0 (u16)
-         *   res0     +2 (u8)
-         *   dataType +3 (u8)
-         *   data     +4 (u32)
-         */
         writeU16(data, attributeOffset + 12, 8);
         data[attributeOffset + 14] = 0;
         data[attributeOffset + 15] = TYPE_INT_BOOLEAN;
-        writeU32(
-                data,
-                attributeOffset + 16,
-                value ? 1 : 0
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // DEX checksum
-    // -------------------------------------------------------------------------
-
-    public static void recomputeChecksums(byte[] dex) {
-        if (dex.length < HEADER_SIZE) {
-            throw new IllegalArgumentException("DEX too small");
-        }
-
-        try {
-            MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
-            sha1.update(
-                    dex,
-                    32,
-                    dex.length - 32
-            );
-
-            byte[] digest = sha1.digest();
-
-            System.arraycopy(
-                    digest,
-                    0,
-                    dex,
-                    12,
-                    digest.length
-            );
-
-            Adler32 adler = new Adler32();
-            adler.update(
-                    dex,
-                    12,
-                    dex.length - 12
-            );
-
-            writeU32(
-                    dex,
-                    8,
-                    (int) adler.getValue()
-            );
-        } catch (Exception e) {
-            throw new IllegalStateException(
-                    "Unable to recompute DEX checksum",
-                    e
-            );
-        }
+        writeU32(data, attributeOffset + 16, value ? 1 : 0);
     }
 
     // -------------------------------------------------------------------------
@@ -1457,38 +1568,53 @@ public final class SuperDexPatcher {
     // -------------------------------------------------------------------------
 
     private static final class DexFile {
+
         final byte[] bytes;
+
         final int fileSize;
         final int headerSize;
+
         final int stringIdsSize;
         final int stringIdsOff;
+
         final int typeIdsSize;
         final int typeIdsOff;
+
         final int protoIdsSize;
         final int protoIdsOff;
+
         final int methodIdsSize;
         final int methodIdsOff;
+
         final int classDefsSize;
         final int classDefsOff;
+
         final int dataSize;
         final int dataOff;
 
         DexFile(byte[] bytes) {
             this.bytes = bytes;
-            fileSize = readCount(bytes, 0x20, "file_size");
-            headerSize = readCount(bytes, 0x24, "header_size");
-            stringIdsSize = readCount(bytes, 0x38, "string_ids_size");
-            stringIdsOff = readCount(bytes, 0x3c, "string_ids_off");
-            typeIdsSize = readCount(bytes, 0x40, "type_ids_size");
-            typeIdsOff = readCount(bytes, 0x44, "type_ids_off");
-            protoIdsSize = readCount(bytes, 0x48, "proto_ids_size");
-            protoIdsOff = readCount(bytes, 0x4c, "proto_ids_off");
-            methodIdsSize = readCount(bytes, 0x58, "method_ids_size");
-            methodIdsOff = readCount(bytes, 0x5c, "method_ids_off");
-            classDefsSize = readCount(bytes, 0x60, "class_defs_size");
-            classDefsOff = readCount(bytes, 0x64, "class_defs_off");
-            dataSize = readCount(bytes, 0x68, "data_size");
-            dataOff = readCount(bytes, 0x6c, "data_off");
+
+            fileSize = readU32Checked(bytes, 0x20);
+            headerSize = readU32Checked(bytes, 0x24);
+
+            stringIdsSize = readU32Checked(bytes, 0x38);
+            stringIdsOff = readU32Checked(bytes, 0x3c);
+
+            typeIdsSize = readU32Checked(bytes, 0x40);
+            typeIdsOff = readU32Checked(bytes, 0x44);
+
+            protoIdsSize = readU32Checked(bytes, 0x48);
+            protoIdsOff = readU32Checked(bytes, 0x4c);
+
+            methodIdsSize = readU32Checked(bytes, 0x58);
+            methodIdsOff = readU32Checked(bytes, 0x5c);
+
+            classDefsSize = readU32Checked(bytes, 0x60);
+            classDefsOff = readU32Checked(bytes, 0x64);
+
+            dataSize = readU32Checked(bytes, 0x68);
+            dataOff = readU32Checked(bytes, 0x6c);
         }
 
         void validate() {
@@ -1496,15 +1622,15 @@ public final class SuperDexPatcher {
                 throw new IllegalArgumentException("DEX header truncated");
             }
 
-            if (bytes[0] != 'd' ||
-                    bytes[1] != 'e' ||
-                    bytes[2] != 'x' ||
-                    bytes[3] != '\n') {
+            if (bytes[0] != 'd' || bytes[1] != 'e' ||
+                    bytes[2] != 'x' || bytes[3] != '\n') {
                 throw new IllegalArgumentException("Invalid DEX magic");
             }
 
             if (bytes[7] != 0) {
-                throw new IllegalArgumentException("Invalid DEX magic terminator");
+                throw new IllegalArgumentException(
+                        "Invalid DEX magic terminator"
+                );
             }
 
             if (headerSize != HEADER_SIZE) {
@@ -1525,14 +1651,12 @@ public final class SuperDexPatcher {
             if (fileSize != bytes.length) {
                 throw new IllegalArgumentException(
                         "DEX file_size mismatch: header=" +
-                                fileSize +
-                                " actual=" +
-                                bytes.length
+                                fileSize + " actual=" + bytes.length
                 );
             }
 
-            if (dataOff < HEADER_SIZE ||
-                    dataOff > bytes.length ||
+            if (dataOff < HEADER_SIZE || dataOff > bytes.length ||
+                    dataSize < 0 ||
                     (long) dataOff + dataSize > bytes.length) {
                 throw new IllegalArgumentException(
                         "Invalid DEX data section"
@@ -1553,8 +1677,7 @@ public final class SuperDexPatcher {
                 int elementSize
         ) {
             if (count == 0) {
-                if (offset != 0 &&
-                        (offset < HEADER_SIZE || offset > bytes.length)) {
+                if (offset != 0 && offset >= bytes.length) {
                     throw new IllegalArgumentException(
                             "Invalid empty " + name + " offset"
                     );
@@ -1568,14 +1691,11 @@ public final class SuperDexPatcher {
                 );
             }
 
-            long end =
-                    (long) offset +
-                            (long) count * elementSize;
+            long end = (long) offset + (long) count * elementSize;
 
             if (end > bytes.length) {
                 throw new IllegalArgumentException(
-                        name + " table exceeds file: end=" + end +
-                                " file=" + bytes.length
+                        name + " table exceeds file"
                 );
             }
 
@@ -1597,16 +1717,9 @@ public final class SuperDexPatcher {
                 );
             }
 
-            int stringOffset = readU32(
-                    stringIdsOff + index * 4
-            );
+            int stringOffset = readU32(stringIdsOff + index * 4);
 
-            checkRange(
-                    stringOffset,
-                    1,
-                    bytes.length,
-                    "string_data"
-            );
+            checkRange(stringOffset, 1, bytes.length, "string_data");
 
             return readMutf8(bytes, stringOffset);
         }
@@ -1618,8 +1731,7 @@ public final class SuperDexPatcher {
                 );
             }
 
-            int descriptorIndex =
-                    readU32(typeIdsOff + typeIndex * 4);
+            int descriptorIndex = readU32(typeIdsOff + typeIndex * 4);
 
             return getString(descriptorIndex);
         }
@@ -1631,9 +1743,7 @@ public final class SuperDexPatcher {
                 );
             }
 
-            int offset =
-                    methodIdsOff +
-                            methodIndex * METHOD_ID_SIZE;
+            int offset = methodIdsOff + methodIndex * METHOD_ID_SIZE;
 
             int classIndex = readU16(bytes, offset);
             int protoIndex = readU16(bytes, offset + 2);
@@ -1641,118 +1751,41 @@ public final class SuperDexPatcher {
 
             String name = getString(nameIndex);
 
-            if (protoIndex < 0 ||
-                    protoIndex >= protoIdsSize) {
+            if (protoIndex < 0 || protoIndex >= protoIdsSize) {
                 throw new IllegalArgumentException(
-                        "proto index out of range: " + protoIndex
+                        "proto index out of range"
                 );
             }
 
-            int protoOffset =
-                    protoIdsOff +
-                            protoIndex * PROTO_ID_SIZE;
+            int protoOffset = protoIdsOff + protoIndex * PROTO_ID_SIZE;
 
             /*
-             * proto_id_struct:
-             *   shorty_idx       u32 @ +0
-             *   return_type_idx  u32 @ +4
-             *   parameters_off   u32 @ +8
+             * proto_id_item: shorty_idx u32 @+0, return_type_idx u32 @+4,
+             * parameters_off u32 @+8. Reading +8 read parameters_off as a
+             * type index — the bug that made every parameterized recipe
+             * silently miss (and void methods match type_ids[0]).
              */
-            int shortyIndex = readU32(protoOffset);
             int returnTypeIndex = readU32(protoOffset + 4);
 
-            String returnDescriptor =
-                    getTypeDescriptor(returnTypeIndex);
-
-            String shorty = getString(shortyIndex);
-
-            if (shorty.isEmpty()) {
-                throw new IllegalArgumentException(
-                        "Empty proto shorty at index " + shortyIndex
-                );
-            }
-
-            verifyShortyAgainstReturn(shorty.charAt(0), returnDescriptor);
+            String returnDescriptor = getTypeDescriptor(returnTypeIndex);
 
             return new MethodInfo(
-                    methodIndex,
-                    classIndex,
-                    protoIndex,
-                    name,
-                    returnDescriptor
+                    methodIndex, classIndex, protoIndex,
+                    name, returnDescriptor
             );
-        }
-
-        private void verifyShortyAgainstReturn(
-                char shortyFirst,
-                String returnDescriptor
-        ) {
-            boolean ok;
-
-            switch (shortyFirst) {
-                case 'V':
-                    ok = "V".equals(returnDescriptor);
-                    break;
-                case 'J':
-                    ok = "J".equals(returnDescriptor);
-                    break;
-                case 'D':
-                    ok = "D".equals(returnDescriptor);
-                    break;
-                case 'Z':
-                case 'B':
-                case 'S':
-                case 'C':
-                case 'I':
-                case 'F':
-                    ok = returnDescriptor.equals(
-                            String.valueOf(shortyFirst)
-                    );
-                    break;
-                case 'L':
-                    /*
-                     * Shorty 'L' covers both object and array returns.
-                     */
-                    ok = returnDescriptor.startsWith("L") ||
-                            returnDescriptor.startsWith("[");
-                    break;
-                default:
-                    ok = false;
-                    break;
-            }
-
-            if (!ok) {
-                throw new IllegalArgumentException(
-                        "proto shorty/return mismatch: shorty='" +
-                                shortyFirst +
-                                "' return=" +
-                                returnDescriptor
-                );
-            }
         }
     }
 
     // -------------------------------------------------------------------------
-    // MUTF-8 (strict)
+    // MUTF-8
     // -------------------------------------------------------------------------
 
-    private static String readMutf8(
-            byte[] data,
-            int offset
-    ) {
+    private static String readMutf8(byte[] data, int offset) {
         Cursor cursor = new Cursor(data, offset);
 
-        int declaredUtf16Length =
-                cursor.readUleb128();
+        int declaredUtf16Length = cursor.readUleb128();
 
-        if (declaredUtf16Length < 0) {
-            throw new IllegalArgumentException(
-                    "Negative declared string length"
-            );
-        }
-
-        StringBuilder out =
-                new StringBuilder(declaredUtf16Length);
+        StringBuilder out = new StringBuilder(declaredUtf16Length);
 
         boolean terminated = false;
 
@@ -1769,101 +1802,47 @@ public final class SuperDexPatcher {
                 continue;
             }
 
-            if (b == 0xC0) {
-                /*
-                 * MUTF-8 encodes U+0000 as 0xC0 0x80. Any other 0xC0
-                 * pair is an overlong encoding and must be rejected.
-                 */
+            if ((b & 0xe0) == 0xc0) {
                 requireBytes(cursor, 1);
 
                 int b2 = data[cursor.position++] & 0xff;
 
-                if (b2 == 0x80) {
+                if (b == 0xc0 && b2 == 0x80) {
                     out.append('\u0000');
                 } else {
-                    throw new IllegalArgumentException(
-                            String.format(
-                                    "Overlong MUTF-8 sequence C0 %02X",
-                                    b2
-                            )
-                    );
+                    if ((b2 & 0xc0) != 0x80) {
+                        throw new IllegalArgumentException(
+                                "Invalid MUTF-8 continuation byte"
+                        );
+                    }
+
+                    int value = ((b & 0x1f) << 6) | (b2 & 0x3f);
+
+                    out.append((char) value);
                 }
+
                 continue;
             }
 
-            if (b == 0xC1) {
-                throw new IllegalArgumentException(
-                        "Overlong MUTF-8 leading byte C1"
-                );
-            }
-
-            if ((b & 0xE0) == 0xC0) {
-                /*
-                 * 0xC2..0xDF: legal two-byte sequences.
-                 */
-                requireBytes(cursor, 1);
-
-                int b2 = data[cursor.position++] & 0xff;
-
-                if ((b2 & 0xC0) != 0x80) {
-                    throw new IllegalArgumentException(
-                            "Invalid MUTF-8 continuation byte"
-                    );
-                }
-
-                int value =
-                        ((b & 0x1F) << 6) |
-                                (b2 & 0x3F);
-
-                if (value < 0x80) {
-                    throw new IllegalArgumentException(
-                            "Overlong MUTF-8 two-byte sequence"
-                    );
-                }
-
-                out.append((char) value);
-                continue;
-            }
-
-            if ((b & 0xF0) == 0xE0) {
-                /*
-                 * Three-byte sequences. Lone surrogates (0xED A0..BF)
-                 * are legal MUTF-8: supplementary characters are stored
-                 * as UTF-16 surrogate pairs.
-                 */
+            if ((b & 0xf0) == 0xe0) {
                 requireBytes(cursor, 2);
 
                 int b2 = data[cursor.position++] & 0xff;
                 int b3 = data[cursor.position++] & 0xff;
 
-                if ((b2 & 0xC0) != 0x80 ||
-                        (b3 & 0xC0) != 0x80) {
+                if ((b2 & 0xc0) != 0x80 || (b3 & 0xc0) != 0x80) {
                     throw new IllegalArgumentException(
                             "Invalid MUTF-8 sequence"
                     );
                 }
 
-                if (b == 0xE0 && b2 < 0xA0) {
-                    throw new IllegalArgumentException(
-                            String.format(
-                                    "Overlong MUTF-8 sequence E0 %02X",
-                                    b2
-                            )
-                    );
-                }
-
-                int value =
-                        ((b & 0x0F) << 12) |
-                                ((b2 & 0x3F) << 6) |
-                                (b3 & 0x3F);
+                int value = ((b & 0x0f) << 12) |
+                        ((b2 & 0x3f) << 6) | (b3 & 0x3f);
 
                 out.append((char) value);
                 continue;
             }
 
-            /*
-             * 0xF0..0xFF never appear in MUTF-8.
-             */
             throw new IllegalArgumentException(
                     "Unsupported MUTF-8 leading byte 0x" +
                             Integer.toHexString(b)
@@ -1876,34 +1855,23 @@ public final class SuperDexPatcher {
             );
         }
 
-        if (out.length() != declaredUtf16Length) {
-            throw new IllegalArgumentException(
-                    "DEX string length mismatch: declared=" +
-                            declaredUtf16Length +
-                            " actual=" +
-                            out.length()
-            );
-        }
-
         return out.toString();
     }
 
-    private static void requireBytes(
-            Cursor cursor,
-            int count
-    ) {
+    private static void requireBytes(Cursor cursor, int count) {
         if (cursor.position + count > cursor.data.length) {
             throw new IllegalArgumentException(
-                    "Truncated MUTF-8 string"
+                    "Truncated MUTF-8 sequence"
             );
         }
     }
 
     // -------------------------------------------------------------------------
-    // Code item
+    // Models
     // -------------------------------------------------------------------------
 
     private static final class CodeItem {
+
         final int registersSize;
         final int insSize;
         final int outsSize;
@@ -1927,53 +1895,18 @@ public final class SuperDexPatcher {
             this.insnsOffset = insnsOffset;
         }
 
-        static CodeItem parse(
-                byte[] data,
-                int offset
-        ) {
-            checkRange(
-                    offset,
-                    16,
-                    data.length,
-                    "code_item"
-            );
+        static CodeItem parse(byte[] data, int offset) {
+            checkRange(offset, 16, data.length, "code_item");
 
-            if ((offset & 3) != 0) {
-                throw new IllegalArgumentException(
-                        "code_item is not 4-byte aligned: 0x" +
-                                Integer.toHexString(offset)
-                );
-            }
-
-            int registersSize =
-                    readU16(data, offset);
-            int insSize =
-                    readU16(data, offset + 2);
-            int outsSize =
-                    readU16(data, offset + 4);
-            int triesSize =
-                    readU16(data, offset + 6);
-            int insnsSize =
-                    readU32Checked(data, offset + 12);
-
-            if (insSize < 0 || insSize > registersSize) {
-                throw new IllegalArgumentException(
-                        "code_item ins_size=" + insSize +
-                                " exceeds registers_size=" + registersSize
-                );
-            }
-
-            if (insnsSize < 0) {
-                throw new IllegalArgumentException(
-                        "code_item insns_size is negative: " + insnsSize
-                );
-            }
+            int registersSize = readU16(data, offset);
+            int insSize = readU16(data, offset + 2);
+            int outsSize = readU16(data, offset + 4);
+            int triesSize = readU16(data, offset + 6);
+            int insnsSize = readU32Checked(data, offset + 12);
 
             int insnsOffset = offset + 16;
 
-            long end =
-                    (long) insnsOffset +
-                            (long) insnsSize * 2L;
+            long end = (long) insnsOffset + (long) insnsSize * 2L;
 
             if (end > data.length) {
                 throw new IllegalArgumentException(
@@ -1982,21 +1915,14 @@ public final class SuperDexPatcher {
             }
 
             return new CodeItem(
-                    registersSize,
-                    insSize,
-                    outsSize,
-                    triesSize,
-                    insnsSize,
-                    insnsOffset
+                    registersSize, insSize, outsSize,
+                    triesSize, insnsSize, insnsOffset
             );
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Recipe / model
-    // -------------------------------------------------------------------------
-
     private static final class Recipe {
+
         final String key;
         final String[] classes;
         final String[] methods;
@@ -2046,6 +1972,7 @@ public final class SuperDexPatcher {
     }
 
     private static final class MethodInfo {
+
         final int methodIndex;
         final int classIndex;
         final int protoIndex;
@@ -2068,15 +1995,12 @@ public final class SuperDexPatcher {
     }
 
     private static final class EncodedMethod {
+
         final int methodIndex;
         final int accessFlags;
         final int codeOffset;
 
-        EncodedMethod(
-                int methodIndex,
-                int accessFlags,
-                int codeOffset
-        ) {
+        EncodedMethod(int methodIndex, int accessFlags, int codeOffset) {
             this.methodIndex = methodIndex;
             this.accessFlags = accessFlags;
             this.codeOffset = codeOffset;
@@ -2084,6 +2008,7 @@ public final class SuperDexPatcher {
     }
 
     private static final class ClassData {
+
         final List<EncodedMethod> methods;
 
         ClassData(List<EncodedMethod> methods) {
@@ -2092,6 +2017,7 @@ public final class SuperDexPatcher {
     }
 
     private static final class Cursor {
+
         final byte[] data;
         int position;
 
@@ -2106,15 +2032,12 @@ public final class SuperDexPatcher {
 
             for (int i = 0; i < 5; i++) {
                 if (position >= data.length) {
-                    throw new IllegalArgumentException(
-                            "Truncated ULEB128"
-                    );
+                    throw new IllegalArgumentException("Truncated ULEB128");
                 }
 
                 int b = data[position++] & 0xff;
 
-                result |=
-                        (b & 0x7f) << shift;
+                result |= (b & 0x7f) << shift;
 
                 if ((b & 0x80) == 0) {
                     return result;
@@ -2123,9 +2046,7 @@ public final class SuperDexPatcher {
                 shift += 7;
             }
 
-            throw new IllegalArgumentException(
-                    "ULEB128 exceeds 5 bytes"
-            );
+            throw new IllegalArgumentException("ULEB128 exceeds 5 bytes");
         }
     }
 
@@ -2134,6 +2055,7 @@ public final class SuperDexPatcher {
     // -------------------------------------------------------------------------
 
     private static final class StringPool {
+
         final int chunkOffset;
         final int chunkSize;
         final int stringCount;
@@ -2157,20 +2079,12 @@ public final class SuperDexPatcher {
             this.offsets = offsets;
         }
 
-        static StringPool parse(
-                byte[] data,
-                int offset
-        ) {
-            int headerSize =
-                    readU16(data, offset + 2);
-            int chunkSize =
-                    readU32Checked(data, offset + 4);
-            int stringCount =
-                    readU32Checked(data, offset + 8);
-            int flags =
-                    readU32Checked(data, offset + 16);
-            int stringsStart =
-                    readU32Checked(data, offset + 20);
+        static StringPool parse(byte[] data, int offset) {
+            int headerSize = readU16(data, offset + 2);
+            int chunkSize = readU32Checked(data, offset + 4);
+            int stringCount = readU32Checked(data, offset + 8);
+            int flags = readU32Checked(data, offset + 16);
+            int stringsStart = readU32Checked(data, offset + 20);
 
             if (headerSize < 28) {
                 throw new IllegalArgumentException(
@@ -2179,20 +2093,14 @@ public final class SuperDexPatcher {
             }
 
             if (stringCount < 0) {
-                throw new IllegalArgumentException(
-                        "Invalid string count"
-                );
+                throw new IllegalArgumentException("Invalid string count");
             }
 
-            int[] offsets =
-                    new int[stringCount];
+            int[] offsets = new int[stringCount];
 
-            int offsetBase =
-                    offset + headerSize;
+            int offsetBase = offset + headerSize;
 
-            long offsetsEnd =
-                    (long) offsetBase +
-                            (long) stringCount * 4L;
+            long offsetsEnd = (long) offsetBase + (long) stringCount * 4L;
 
             if (offsetsEnd > offset + chunkSize ||
                     offsetsEnd > data.length) {
@@ -2202,20 +2110,12 @@ public final class SuperDexPatcher {
             }
 
             for (int i = 0; i < stringCount; i++) {
-                offsets[i] =
-                        readU32Checked(
-                                data,
-                                offsetBase + i * 4
-                        );
+                offsets[i] = readU32Checked(data, offsetBase + i * 4);
             }
 
             return new StringPool(
-                    offset,
-                    chunkSize,
-                    stringCount,
-                    flags,
-                    stringsStart,
-                    offsets
+                    offset, chunkSize, stringCount,
+                    flags, stringsStart, offsets
             );
         }
     }
@@ -2224,83 +2124,31 @@ public final class SuperDexPatcher {
     // Binary helpers
     // -------------------------------------------------------------------------
 
-    private static int readCount(
-            byte[] data,
-            int offset,
-            String what
-    ) {
-        int value = readU32Checked(data, offset);
+    private static int readU16(byte[] data, int offset) {
+        checkRange(offset, 2, data.length, "u16");
 
-        if (value < 0) {
-            throw new IllegalArgumentException(
-                    what + " is negative: " + (value & 0xFFFFFFFFL)
-            );
-        }
-
-        return value;
+        return (data[offset] & 0xff) |
+                ((data[offset + 1] & 0xff) << 8);
     }
 
-    private static int readU16(
-            byte[] data,
-            int offset
-    ) {
-        checkRange(
-                offset,
-                2,
-                data.length,
-                "u16"
-        );
+    private static int readU32Checked(byte[] data, int offset) {
+        checkRange(offset, 4, data.length, "u32");
 
-        return
-                (data[offset] & 0xff) |
-                        ((data[offset + 1] & 0xff) << 8);
+        return (data[offset] & 0xff) |
+                ((data[offset + 1] & 0xff) << 8) |
+                ((data[offset + 2] & 0xff) << 16) |
+                ((data[offset + 3] & 0xff) << 24);
     }
 
-    private static int readU32Checked(
-            byte[] data,
-            int offset
-    ) {
-        checkRange(
-                offset,
-                4,
-                data.length,
-                "u32"
-        );
-
-        return
-                (data[offset] & 0xff) |
-                        ((data[offset + 1] & 0xff) << 8) |
-                        ((data[offset + 2] & 0xff) << 16) |
-                        ((data[offset + 3] & 0xff) << 24);
-    }
-
-    private static void writeU16(
-            byte[] data,
-            int offset,
-            int value
-    ) {
-        checkRange(
-                offset,
-                2,
-                data.length,
-                "u16 write"
-        );
+    private static void writeU16(byte[] data, int offset, int value) {
+        checkRange(offset, 2, data.length, "u16 write");
 
         data[offset] = (byte) value;
         data[offset + 1] = (byte) (value >>> 8);
     }
 
-    private static void writeU32(
-            byte[] data,
-            int offset,
-            int value
-    ) {
-        checkRange(
-                offset,
-                4,
-                data.length,
-                "u32 write"
-        );
+    private static void writeU32(byte[] data, int offset, int value) {
+        checkRange(offset, 4, data.length, "u32 write");
 
         data[offset] = (byte) value;
         data[offset + 1] = (byte) (value >>> 8);
@@ -2314,28 +2162,39 @@ public final class SuperDexPatcher {
             int total,
             String what
     ) {
-        if (offset < 0 ||
-                length < 0 ||
+        if (offset < 0 || length < 0 ||
                 (long) offset + length > total) {
             throw new IllegalArgumentException(
-                    "Invalid " + what +
-                            " range: offset=" +
-                            offset +
-                            " length=" +
-                            length +
-                            " total=" +
-                            total
+                    "Invalid " + what + " range: offset=" +
+                            offset + " length=" + length +
+                            " total=" + total
             );
         }
     }
 
-    private static byte[] readAll(
-            InputStream input
-    ) throws IOException {
-        ByteArrayOutputStream out =
-                new ByteArrayOutputStream();
+    private static boolean containsBytes(byte[] data, byte[] pattern) {
+        if (pattern.length == 0 || pattern.length > data.length) {
+            return false;
+        }
+
+        outer:
+        for (int i = 0; i <= data.length - pattern.length; i++) {
+            for (int j = 0; j < pattern.length; j++) {
+                if (data[i + j] != pattern[j]) {
+                    continue outer;
+                }
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    private static byte[] readAll(InputStream input) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
 
         byte[] buffer = new byte[64 * 1024];
+
         int n;
 
         while ((n = input.read(buffer)) != -1) {
@@ -2345,12 +2204,10 @@ public final class SuperDexPatcher {
         return out.toByteArray();
     }
 
-    private static void log(
-            Progress progress,
-            String message
-    ) {
+    private static void log(Progress progress, String message) {
         if (progress != null) {
             progress.log(message);
         }
     }
 }
+
