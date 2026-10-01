@@ -30,21 +30,17 @@ import java.util.zip.Adler32;
  *
  *  - cross-validates proto shorty against the return descriptor and
  *    refuses the file on mismatch
- *  - decodes DEX strings as strict MUTF-8 (rejects overlong encodings,
- *    requires NUL terminator, verifies declared UTF-16 length)
+ *  - decodes DEX strings as strict MUTF-8
  *  - resolves methods structurally through class_defs -> class_data ->
  *    method_ids -> name_idx -> string_ids; never through const-string scans
- *  - never touches ACC_NATIVE or ACC_ABSTRACT methods, refuses unaligned
- *    or out-of-range code_offsets
+ *  - never touches ACC_NATIVE or ACC_ABSTRACT methods
  *  - refuses methods with exception handlers (tries_size != 0)
- *  - recomputes SHA-1 + Adler32 only after successful mutation, then
- *    re-validates the result before handing it out
+ *  - recomputes SHA-1 + Adler32 only after successful mutation
  *
  * Detection:
- *  - DEX level: exact descriptor presence in type_ids (DETECTORS map)
- *  - Manifest level: AXML attribute walk resolved through the resource
- *    map; only reports patches whose attribute exists with a value that
- *    differs from the patch target
+ *  - DEX level: exact descriptor presence in type_ids (DETECTORS map,
+ *    built generically from RECIPES so every recipe key is auto-detected)
+ *  - Manifest level: AXML attribute walk resolved through the resource map
  *
  * Recipes are structural (class descriptor + method name + expected
  * return type), exact-matched against type_ids — no substring matching.
@@ -93,154 +89,210 @@ public final class SuperDexPatcher {
     static {
         List<Recipe> recipes = new ArrayList<>();
 
-        recipes.add(new Recipe(
-                "DISABLE_ANALYTICS",
-                new String[]{
-                        "Lcom/google/firebase/analytics/FirebaseAnalytics;"
-                },
-                new String[]{
-                        "logEvent"
-                },
-                "V"
-        ));
+        /* ── Analytics ─────────────────────────────────────────────────── */
 
         recipes.add(new Recipe(
                 "DISABLE_ANALYTICS",
-                new String[]{
-                        "Lcom/mixpanel/android/mpmetrics/MixpanelAPI;"
-                },
-                new String[]{
-                        "track",
-                        "trackMap"
-                },
-                "V"
-        ));
+                new String[]{ "Lcom/google/firebase/analytics/FirebaseAnalytics;" },
+                new String[]{ "logEvent" },
+                "V"));
+
+        recipes.add(new Recipe(
+                "DISABLE_ANALYTICS",
+                new String[]{ "Lcom/mixpanel/android/mpmetrics/MixpanelAPI;" },
+                new String[]{ "track", "trackMap" },
+                "V"));
+
+        /* ── Telemetry ─────────────────────────────────────────────────── */
 
         recipes.add(new Recipe(
                 "REMOVE_TELEMETRY",
-                new String[]{
-                        "Lio/sentry/Sentry;"
-                },
-                new String[]{
-                        "captureException",
-                        "captureMessage",
-                        "captureEvent"
-                },
-                null
-        ));
+                new String[]{ "Lio/sentry/Sentry;" },
+                new String[]{ "captureException", "captureMessage", "captureEvent" },
+                null));
 
         recipes.add(new Recipe(
                 "REMOVE_TELEMETRY",
-                new String[]{
-                        "Lcom/google/firebase/crashlytics/FirebaseCrashlytics;"
-                },
-                new String[]{
-                        "recordException",
-                        "log"
-                },
-                "V"
-        ));
+                new String[]{ "Lcom/google/firebase/crashlytics/FirebaseCrashlytics;" },
+                new String[]{ "recordException", "log" },
+                "V"));
 
         recipes.add(new Recipe(
                 "REMOVE_TELEMETRY",
+                new String[]{ "Lcom/bugsnag/android/Bugsnag;" },
+                new String[]{ "notify" },
+                null));
+
+        /* ── Ads: legacy GMA SDK ───────────────────────────────────────── */
+
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
+                new String[]{ "Lcom/google/android/gms/ads/AdView;" },
+                new String[]{ "loadAd" },
+                "V"));
+
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
                 new String[]{
-                        "Lcom/bugsnag/android/Bugsnag;"
+                        "Lcom/google/android/gms/ads/InterstitialAd;",
+                        "Lcom/google/android/gms/ads/AppOpenAd;",
+                        "Lcom/google/android/gms/ads/rewarded/RewardedAd;"
                 },
-                new String[]{
-                        "notify"
-                },
-                null
-        ));
+                new String[]{ "show" },
+                "V"));
 
         /*
-         * Ad SDK entry points (REMOVE_ADS). All targets are void
-         * load/display methods; ret-void stubs suppress ad loading
-         * and display without touching layout or lifecycle code.
+         * Ads: modern GMA SDK (v20+). The entry-point classes moved into
+         * subpackages — banner/, interstitial/, appopen/, rewarded/. Apps
+         * built against recent play-services-ads only carry these.
          */
-        recipes.add(new Recipe("REMOVE_ADS",
-                new String[]{ "Lcom/google/android/gms/ads/AdView;" },
-                new String[]{ "loadAd" }, "V"));
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
+                new String[]{ "Lcom/google/android/gms/ads/banner/BannerView;" },
+                new String[]{ "loadAd" },
+                "V"));
 
-        recipes.add(new Recipe("REMOVE_ADS",
-                new String[]{ "Lcom/google/android/gms/ads/InterstitialAd;",
-                              "Lcom/google/android/gms/ads/AppOpenAd;",
-                              "Lcom/google/android/gms/ads/rewarded/RewardedAd;" },
-                new String[]{ "show" }, "V"));
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
+                new String[]{
+                        "Lcom/google/android/gms/ads/interstitial/InterstitialAd;",
+                        "Lcom/google/android/gms/ads/rewarded/RewardedAd;",
+                        "Lcom/google/android/gms/ads/appopen/AppOpenAd;"
+                },
+                new String[]{ "show" },
+                "V"));
 
-        recipes.add(new Recipe("REMOVE_ADS",
-                new String[]{ "Lcom/facebook/ads/AdView;", "Lcom/facebook/ads/BannerAdView;" },
-                new String[]{ "loadAd" }, "V"));
+        /* ── Ads: Facebook / Unity / AppLovin / IronSource / MoPub ─────── */
 
-        recipes.add(new Recipe("REMOVE_ADS",
-                new String[]{ "Lcom/facebook/ads/InterstitialAd;",
-                              "Lcom/facebook/ads/RewardedVideoAd;",
-                              "Lcom/facebook/ads/RewardedAd;" },
-                new String[]{ "show", "loadAd" }, "V"));
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
+                new String[]{
+                        "Lcom/facebook/ads/AdView;",
+                        "Lcom/facebook/ads/BannerAdView;"
+                },
+                new String[]{ "loadAd" },
+                "V"));
 
-        recipes.add(new Recipe("REMOVE_ADS",
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
+                new String[]{
+                        "Lcom/facebook/ads/InterstitialAd;",
+                        "Lcom/facebook/ads/RewardedVideoAd;",
+                        "Lcom/facebook/ads/RewardedAd;"
+                },
+                new String[]{ "show", "loadAd" },
+                "V"));
+
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
                 new String[]{ "Lcom/unity3d/ads/UnityAds;" },
-                new String[]{ "show", "load" }, "V"));
+                new String[]{ "show", "load" },
+                "V"));
 
-        recipes.add(new Recipe("REMOVE_ADS",
-                new String[]{ "Lcom/applovin/adview/AppLovinAdView;",
-                              "Lcom/applovin/mediation/ads/MaxInterstitialAd;",
-                              "Lcom/applovin/mediation/ads/MaxAdView;" },
-                new String[]{ "showAd", "show", "loadAd", "load" }, "V"));
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
+                new String[]{
+                        "Lcom/applovin/adview/AppLovinAdView;",
+                        "Lcom/applovin/mediation/ads/MaxInterstitialAd;",
+                        "Lcom/applovin/mediation/ads/MaxAdView;"
+                },
+                new String[]{ "showAd", "show", "loadAd", "load" },
+                "V"));
 
-        recipes.add(new Recipe("REMOVE_ADS",
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
                 new String[]{ "Lcom/ironsource/mediationsdk/IronSource;" },
-                new String[]{ "showInterstitial", "showRewardedVideo" }, "V"));
+                new String[]{ "showInterstitial", "showRewardedVideo" },
+                "V"));
 
-        recipes.add(new Recipe("REMOVE_ADS",
-                new String[]{ "Lcom/mopub/mobileads/MoPubView;",
-                              "Lcom/mopub/mobileads/MoPubInterstitial;" },
-                new String[]{ "loadAd", "show" }, "V"));
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
+                new String[]{
+                        "Lcom/mopub/mobileads/MoPubView;",
+                        "Lcom/mopub/mobileads/MoPubInterstitial;"
+                },
+                new String[]{ "loadAd", "show" },
+                "V"));
 
-        recipes.add(new Recipe("REMOVE_ADS",
-                new String[]{ "Lcom/vungle/warren/Vungle;",
-                              "Lcom/vungle/ads/InterstitialAd;" },
-                new String[]{ "playAd", "show", "load" }, "V"));
+        /* ── Ads: Vungle / InMobi / Chartboost ─────────────────────────── */
 
-        recipes.add(new Recipe("REMOVE_ADS",
-                new String[]{ "Lcom/inmobi/ads/InMobiBanner;",
-                              "Lcom/inmobi/ads/InMobiInterstitial;" },
-                new String[]{ "load", "show" }, "V"));
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
+                new String[]{
+                        "Lcom/vungle/warren/Vungle;",
+                        "Lcom/vungle/ads/InterstitialAd;"
+                },
+                new String[]{ "playAd", "show", "load" },
+                "V"));
 
-        recipes.add(new Recipe("REMOVE_ADS",
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
+                new String[]{
+                        "Lcom/inmobi/ads/InMobiBanner;",
+                        "Lcom/inmobi/ads/InMobiInterstitial;"
+                },
+                new String[]{ "load", "show" },
+                "V"));
+
+        recipes.add(new Recipe(
+                "REMOVE_ADS",
                 new String[]{ "Lcom/chartboost/sdk/Chartboost;" },
-                new String[]{ "showInterstitial", "showRewardedVideo" }, "V"));
+                new String[]{ "showInterstitial", "showRewardedVideo" },
+                "V"));
+
+        /*
+         * SSL pinning bypass (SSL_BYPASS). OkHttp entry points:
+         *  - CertificatePinner.check(...) is void; stubbing it turns every
+         *    pin check into a no-op (pin failure would throw).
+         *  - OkHostnameVerifier.verify(...) is boolean; stubbing it makes
+         *    hostname verification always pass.
+         */
+        recipes.add(new Recipe(
+                "SSL_BYPASS",
+                new String[]{ "Lokhttp3/CertificatePinner;" },
+                new String[]{ "check" },
+                "V"));
+
+        recipes.add(new Recipe(
+                "SSL_BYPASS",
+                new String[]{ "Lokhttp3/internal/tls/OkHostnameVerifier;" },
+                new String[]{ "verify" },
+                "Z"));
+
+        /*
+         * Root detection bypass (ROOT_BYPASS). RootBeer's two public
+         * verdict methods are boolean; stubbing them returns false
+         * (const/4 v0, 0 + return) = "not rooted".
+         */
+        recipes.add(new Recipe(
+                "ROOT_BYPASS",
+                new String[]{ "Lcom/scottyab/rootbeer/RootBeer;" },
+                new String[]{ "isRooted", "isRootedWithoutBusyBoxCheck" },
+                "Z"));
 
         RECIPES = Collections.unmodifiableList(recipes);
     }
 
     /**
-     * Exact-descriptor detectors. Presence of an SDK entry-point class in
-     * type_ids marks a patch as APPLICABLE — the transform re-verifies
-     * structurally at patch time, so a stale candidate can never corrupt
-     * anything: it just no-ops with a loud log line.
+     * Exact-descriptor detectors, built generically from RECIPES.
+     * Adding a recipe above automatically makes its patch auto-detected —
+     * no second list to maintain, no keys left behind.
      */
     private static final Map<String, List<String>> DETECTORS;
 
     static {
         Map<String, List<String>> detectors = new HashMap<>();
 
-        List<String> ads = new ArrayList<>();
-        List<String> analytics = new ArrayList<>();
-        List<String> telemetry = new ArrayList<>();
-
         for (Recipe recipe : RECIPES) {
-            if ("REMOVE_ADS".equals(recipe.key)) {
-                Collections.addAll(ads, recipe.classes);
-            } else if ("DISABLE_ANALYTICS".equals(recipe.key)) {
-                Collections.addAll(analytics, recipe.classes);
-            } else if ("REMOVE_TELEMETRY".equals(recipe.key)) {
-                Collections.addAll(telemetry, recipe.classes);
-            }
-        }
+            List<String> classes = detectors.get(recipe.key);
 
-        detectors.put("REMOVE_ADS", ads);
-        detectors.put("DISABLE_ANALYTICS", analytics);
-        detectors.put("REMOVE_TELEMETRY", telemetry);
+            if (classes == null) {
+                classes = new ArrayList<>();
+                detectors.put(recipe.key, classes);
+            }
+
+            Collections.addAll(classes, recipe.classes);
+        }
 
         DETECTORS = Collections.unmodifiableMap(detectors);
     }
@@ -490,6 +542,10 @@ public final class SuperDexPatcher {
                 return "Analytics SDK detected";
             case "REMOVE_TELEMETRY":
                 return "Telemetry SDK detected";
+            case "SSL_BYPASS":
+                return "OkHttp certificate pinning detected";
+            case "ROOT_BYPASS":
+                return "RootBeer root detection detected";
             default:
                 return "Detected";
         }
@@ -497,10 +553,7 @@ public final class SuperDexPatcher {
 
     /**
      * Manifest-level detection. Only reports a patch when the attribute
-     * EXISTS and its current value differs from the patch target — an
-     * attribute that is absent cannot be rewritten by the current AXML
-     * transformer (it modifies in place, never grows chunks), so
-     * reporting it would be promising a no-op.
+     * EXISTS and its current value differs from the patch target.
      */
     public static Set<String> scanManifestKeys(byte[] manifest) {
         Set<String> keys = new HashSet<>();
@@ -561,7 +614,6 @@ public final class SuperDexPatcher {
                         cursor + nodeHeaderSize + 20 <= manifest.length) {
 
                     int ext = cursor + nodeHeaderSize;
-
                     int attributeStart = readU16(manifest, ext + 8);
                     int attributeSize = readU16(manifest, ext + 10);
                     int attributeCount = readU16(manifest, ext + 12);
@@ -576,7 +628,6 @@ public final class SuperDexPatcher {
                             }
 
                             int attr = base + i * attributeSize;
-
                             int nameStringIndex =
                                     readU32Checked(manifest, attr + 4);
 
@@ -710,11 +761,8 @@ public final class SuperDexPatcher {
 
         for (int classIndex = 0; classIndex < file.classDefsSize; classIndex++) {
             int classDef = file.classDefsOff + classIndex * CLASS_DEF_SIZE;
-
             int classTypeIndex = file.readU32(classDef);
-
             String classDescriptor = file.getTypeDescriptor(classTypeIndex);
-
             int classDataOff = file.readU32(classDef + 24);
 
             if (classDataOff == 0) {
@@ -731,7 +779,6 @@ public final class SuperDexPatcher {
             ClassData data = parseClassData(file, out, classDataOff);
 
             for (EncodedMethod method : data.methods) {
-
                 if ((method.accessFlags & (ACC_NATIVE | ACC_ABSTRACT)) != 0) {
                     /*
                      * Native and abstract methods carry no code_item.
@@ -827,7 +874,6 @@ public final class SuperDexPatcher {
         for (int classIndex = 0; classIndex < file.classDefsSize; classIndex++) {
             int classDef = file.classDefsOff + classIndex * CLASS_DEF_SIZE;
             int typeIndex = file.readU32(classDef);
-
             String descriptor = file.getTypeDescriptor(typeIndex);
 
             if (!recipe.matchesClass(descriptor)) {
@@ -845,7 +891,6 @@ public final class SuperDexPatcher {
             ClassData data = parseClassData(file, file.bytes, classDataOff);
 
             for (EncodedMethod method : data.methods) {
-
                 if ((method.accessFlags & (ACC_NATIVE | ACC_ABSTRACT)) != 0) {
                     continue;
                 }
@@ -926,7 +971,7 @@ public final class SuperDexPatcher {
 
         if ("V".equals(returnType)) {
             /*
-             * return-void  => 0x000e
+             * return-void => 0x000e
              */
             writeU16(data, offset, 0x000e);
             return;
@@ -934,8 +979,8 @@ public final class SuperDexPatcher {
 
         if ("J".equals(returnType) || "D".equals(returnType)) {
             /*
-             * const-wide/16 v0, #0   => 0x0016, literal 0x0000
-             * return-wide v0         => 0x0010
+             * const-wide/16 v0, #0 => 0x0016, literal 0x0000
+             * return-wide v0 => 0x0010
              */
             if (registersSize < 2) {
                 throw new IllegalArgumentException(
@@ -958,8 +1003,8 @@ public final class SuperDexPatcher {
         }
 
         /*
-         * const/4 v0, #0   format 11n, A=0, B=0 => 0x0012
-         * return v0        => 0x000f
+         * const/4 v0, #0 format 11n, A=0, B=0 => 0x0012
+         * return v0 => 0x000f
          * return-object v0 => 0x0011 (object/array return types)
          */
         writeU16(data, offset, 0x0012);
@@ -1049,25 +1094,24 @@ public final class SuperDexPatcher {
          * START_ELEMENT:
          *
          * ResXMLTree_node
-         *   type          u16
-         *   headerSize    u16
-         *   size          u32
-         *   lineNumber    u32
-         *   comment       u32
+         *   type u16
+         *   headerSize u16
+         *   size u32
+         *   lineNumber u32
+         *   comment u32
          *
          * ResXMLTree_attrExt (at nodeHeaderSize)
-         *   ns             u32
-         *   name           u32
+         *   ns u32
+         *   name u32
          *   attributeStart u16
-         *   attributeSize  u16
+         *   attributeSize u16
          *   attributeCount u16
-         *   idIndex        u16
-         *   classIndex     u16
-         *   styleIndex     u16
+         *   idIndex u16
+         *   classIndex u16
+         *   styleIndex u16
          *
          * followed by attributeCount ResXMLTree_attribute entries.
          */
-
         if (chunkOffset + 36 > data.length) {
             throw new IllegalArgumentException("Truncated START_ELEMENT");
         }
@@ -1114,7 +1158,6 @@ public final class SuperDexPatcher {
 
         for (int i = 0; i < attributeCount; i++) {
             int attr = attributesBase + i * attributeSize;
-
             int nameStringIndex = readU32Checked(data, attr + 4);
 
             int resourceId = resolveResourceId(
@@ -1125,28 +1168,24 @@ public final class SuperDexPatcher {
 
             if (resourceId == ATTR_DEBUGGABLE &&
                     keys.contains("FORCE_DEBUGGABLE")) {
-
                 writeBooleanValue(data, attr, true);
                 changed = true;
             }
 
             if (resourceId == ATTR_EXPORTED &&
                     keys.contains("EXPORT_ALL_COMPONENTS")) {
-
                 writeBooleanValue(data, attr, true);
                 changed = true;
             }
 
             if (resourceId == ATTR_ALLOW_BACKUP &&
                     keys.contains("ALLOW_BACKUP")) {
-
                 writeBooleanValue(data, attr, true);
                 changed = true;
             }
 
             if (resourceId == ATTR_FULL_BACKUP_ONLY &&
                     keys.contains("ALLOW_BACKUP")) {
-
                 writeBooleanValue(data, attr, false);
                 changed = true;
             }
@@ -1193,18 +1232,17 @@ public final class SuperDexPatcher {
     ) {
         /*
          * Attribute:
-         *   ns         +0
-         *   name       +4
+         *   ns        +0
+         *   name      +4
          *   rawValue  +8
          *   typedValue +12
          *
          * typedValue (Res_value):
-         *   size       +0 (u16)
-         *   res0       +2 (u8)
-         *   dataType   +3 (u8)
-         *   data       +4 (u32)
+         *   size     +0 (u16)
+         *   res0     +2 (u8)
+         *   dataType +3 (u8)
+         *   data     +4 (u32)
          */
-
         writeU16(data, attributeOffset + 12, 8);
         data[attributeOffset + 14] = 0;
         data[attributeOffset + 15] = TYPE_INT_BOOLEAN;
@@ -1226,7 +1264,6 @@ public final class SuperDexPatcher {
 
         try {
             MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
-
             sha1.update(
                     dex,
                     32,
@@ -1268,51 +1305,36 @@ public final class SuperDexPatcher {
     // -------------------------------------------------------------------------
 
     private static final class DexFile {
-
         final byte[] bytes;
-
         final int fileSize;
         final int headerSize;
-
         final int stringIdsSize;
         final int stringIdsOff;
-
         final int typeIdsSize;
         final int typeIdsOff;
-
         final int protoIdsSize;
         final int protoIdsOff;
-
         final int methodIdsSize;
         final int methodIdsOff;
-
         final int classDefsSize;
         final int classDefsOff;
-
         final int dataSize;
         final int dataOff;
 
         DexFile(byte[] bytes) {
             this.bytes = bytes;
-
             fileSize = readCount(bytes, 0x20, "file_size");
             headerSize = readCount(bytes, 0x24, "header_size");
-
             stringIdsSize = readCount(bytes, 0x38, "string_ids_size");
             stringIdsOff = readCount(bytes, 0x3c, "string_ids_off");
-
             typeIdsSize = readCount(bytes, 0x40, "type_ids_size");
             typeIdsOff = readCount(bytes, 0x44, "type_ids_off");
-
             protoIdsSize = readCount(bytes, 0x48, "proto_ids_size");
             protoIdsOff = readCount(bytes, 0x4c, "proto_ids_off");
-
             methodIdsSize = readCount(bytes, 0x58, "method_ids_size");
             methodIdsOff = readCount(bytes, 0x5c, "method_ids_off");
-
             classDefsSize = readCount(bytes, 0x60, "class_defs_size");
             classDefsOff = readCount(bytes, 0x64, "class_defs_off");
-
             dataSize = readCount(bytes, 0x68, "data_size");
             dataOff = readCount(bytes, 0x6c, "data_off");
         }
@@ -1360,7 +1382,6 @@ public final class SuperDexPatcher {
             if (dataOff < HEADER_SIZE ||
                     dataOff > bytes.length ||
                     (long) dataOff + dataSize > bytes.length) {
-
                 throw new IllegalArgumentException(
                         "Invalid DEX data section"
                 );
@@ -1481,9 +1502,9 @@ public final class SuperDexPatcher {
 
             /*
              * proto_id_struct:
-             *   shorty_idx      u32 @ +0
-             *   return_type_idx u32 @ +4
-             *   parameters_off  u32 @ +8
+             *   shorty_idx       u32 @ +0
+             *   return_type_idx  u32 @ +4
+             *   parameters_off   u32 @ +8
              */
             int shortyIndex = readU32(protoOffset);
             int returnTypeIndex = readU32(protoOffset + 4);
@@ -1520,15 +1541,12 @@ public final class SuperDexPatcher {
                 case 'V':
                     ok = "V".equals(returnDescriptor);
                     break;
-
                 case 'J':
                     ok = "J".equals(returnDescriptor);
                     break;
-
                 case 'D':
                     ok = "D".equals(returnDescriptor);
                     break;
-
                 case 'Z':
                 case 'B':
                 case 'S':
@@ -1539,7 +1557,6 @@ public final class SuperDexPatcher {
                             String.valueOf(shortyFirst)
                     );
                     break;
-
                 case 'L':
                     /*
                      * Shorty 'L' covers both object and array returns.
@@ -1547,7 +1564,6 @@ public final class SuperDexPatcher {
                     ok = returnDescriptor.startsWith("L") ||
                             returnDescriptor.startsWith("[");
                     break;
-
                 default:
                     ok = false;
                     break;
@@ -1620,7 +1636,6 @@ public final class SuperDexPatcher {
                             )
                     );
                 }
-
                 continue;
             }
 
@@ -1737,7 +1752,6 @@ public final class SuperDexPatcher {
     // -------------------------------------------------------------------------
 
     private static final class CodeItem {
-
         final int registersSize;
         final int insSize;
         final int outsSize;
@@ -1781,16 +1795,12 @@ public final class SuperDexPatcher {
 
             int registersSize =
                     readU16(data, offset);
-
             int insSize =
                     readU16(data, offset + 2);
-
             int outsSize =
                     readU16(data, offset + 4);
-
             int triesSize =
                     readU16(data, offset + 6);
-
             int insnsSize =
                     readU32Checked(data, offset + 12);
 
@@ -1835,7 +1845,6 @@ public final class SuperDexPatcher {
     // -------------------------------------------------------------------------
 
     private static final class Recipe {
-
         final String key;
         final String[] classes;
         final String[] methods;
@@ -1859,7 +1868,6 @@ public final class SuperDexPatcher {
                     return true;
                 }
             }
-
             return false;
         }
 
@@ -1869,13 +1877,11 @@ public final class SuperDexPatcher {
                     return true;
                 }
             }
-
             return false;
         }
     }
 
     private static final class MethodInfo {
-
         final int methodIndex;
         final int classIndex;
         final int protoIndex;
@@ -1898,7 +1904,6 @@ public final class SuperDexPatcher {
     }
 
     private static final class EncodedMethod {
-
         final int methodIndex;
         final int accessFlags;
         final int codeOffset;
@@ -1915,7 +1920,6 @@ public final class SuperDexPatcher {
     }
 
     private static final class ClassData {
-
         final List<EncodedMethod> methods;
 
         ClassData(List<EncodedMethod> methods) {
@@ -1924,7 +1928,6 @@ public final class SuperDexPatcher {
     }
 
     private static final class Cursor {
-
         final byte[] data;
         int position;
 
@@ -1967,7 +1970,6 @@ public final class SuperDexPatcher {
     // -------------------------------------------------------------------------
 
     private static final class StringPool {
-
         final int chunkOffset;
         final int chunkSize;
         final int stringCount;
@@ -1997,16 +1999,12 @@ public final class SuperDexPatcher {
         ) {
             int headerSize =
                     readU16(data, offset + 2);
-
             int chunkSize =
                     readU32Checked(data, offset + 4);
-
             int stringCount =
                     readU32Checked(data, offset + 8);
-
             int flags =
                     readU32Checked(data, offset + 16);
-
             int stringsStart =
                     readU32Checked(data, offset + 20);
 
@@ -2155,7 +2153,6 @@ public final class SuperDexPatcher {
         if (offset < 0 ||
                 length < 0 ||
                 (long) offset + length > total) {
-
             throw new IllegalArgumentException(
                     "Invalid " + what +
                             " range: offset=" +
@@ -2175,7 +2172,6 @@ public final class SuperDexPatcher {
                 new ByteArrayOutputStream();
 
         byte[] buffer = new byte[64 * 1024];
-
         int n;
 
         while ((n = input.read(buffer)) != -1) {
