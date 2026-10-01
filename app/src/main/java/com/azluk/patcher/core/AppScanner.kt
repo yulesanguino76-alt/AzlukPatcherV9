@@ -15,48 +15,72 @@ class AppScanner(private val ctx: Context) {
 
     fun getAll(): List<AppInfo> {
         val pm = ctx.packageManager
+
         return pm.getInstalledPackages(0).mapNotNull { pi ->
             if (pi.packageName == ctx.packageName) return@mapNotNull null
+
             try {
                 val ai = pi.applicationInfo
+
                 AppInfo(
-                    packageName  = pi.packageName,
-                    appName      = pm.getApplicationLabel(ai).toString(),
-                    icon         = safeIcon(pm, ai),
-                    isSystemApp  = (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
-                    apkPath      = ai.sourceDir,
-                    versionName  = pi.versionName ?: "?",
-                    apkSizeMb    = File(ai.sourceDir).length() / (1024f * 1024f)
+                    packageName = pi.packageName,
+                    appName = pm.getApplicationLabel(ai).toString(),
+                    icon = safeIcon(pm, ai),
+                    isSystemApp = (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
+                    apkPath = ai.sourceDir,
+                    versionName = pi.versionName ?: "?",
+                    apkSizeMb = File(ai.sourceDir).length() / (1024f * 1024f)
                 )
-            } catch (_: Exception) { null }
+            } catch (_: Exception) {
+                null
+            }
         }.sortedWith(
-            compareBy<AppInfo> { it.isSystemApp }.thenBy { it.appName.lowercase() }
+            compareBy<AppInfo> { it.isSystemApp }
+                .thenBy { it.appName.lowercase() }
         )
     }
 
     /**
-     * Convert any Drawable (including AdaptiveIconDrawable on API 26+)
-     * to a BitmapDrawable so Compose canvas can render it safely.
-     * AdaptiveIconDrawable crashes when drawn directly via nativeCanvas.
+     * Convert only AdaptiveIconDrawable to bitmap (it crashes when drawn
+     * through a native canvas); every other Drawable passes through
+     * untouched — no conversion cost for the majority of apps.
      */
-    private fun safeIcon(pm: PackageManager, ai: ApplicationInfo): Drawable? {
+    private fun safeIcon(
+        pm: PackageManager,
+        ai: ApplicationInfo
+    ): Drawable? {
         return try {
             val raw = pm.getApplicationIcon(ai)
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
-                raw is AdaptiveIconDrawable) {
+                raw is AdaptiveIconDrawable
+            ) {
                 toBitmap(raw)
             } else {
                 raw
             }
-        } catch (_: Exception) { null }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun toBitmap(d: Drawable): BitmapDrawable {
-        val size = 192
-        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        /*
+         * 96px instead of 192px: identical look in list rows, 4x less
+         * bitmap memory and draw time across a few hundred apps — this
+         * was the hidden startup cost of the app list.
+         */
+        val size = 96
+
+        val bmp = Bitmap.createBitmap(
+            size, size, Bitmap.Config.ARGB_8888
+        )
+
         val canvas = Canvas(bmp)
+
         d.setBounds(0, 0, size, size)
         d.draw(canvas)
+
         return BitmapDrawable(ctx.resources, bmp)
     }
 }
