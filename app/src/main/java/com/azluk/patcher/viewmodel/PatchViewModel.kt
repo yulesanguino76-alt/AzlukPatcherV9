@@ -126,7 +126,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             runCatching {
-                val app     = getApplication<Application>()
+                val app = getApplication<Application>()
                 val resolver = app.contentResolver
 
                 val displayName = runCatching {
@@ -199,7 +199,6 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun patchActiveSource(pkg: String) {
         val file = _state.value.scannedFile
-
         if (file != null) {
             patchFile(file)
         } else {
@@ -313,27 +312,65 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
     // ── Install result + AzlukAI ───────────────────────────────────────────────
 
     fun onInstallResult(status: Int, message: String?) {
-        val ist = when (status) {
-            PackageInstaller.STATUS_SUCCESS ->
+        val msg = message ?: ""
+
+        val ist = when {
+            /*
+             * Finsky rejects installing a lone base.apk as an update of a
+             * package that was installed with split APKs. The build is
+             * valid — the container (.apks) must be installed instead.
+             */
+            msg.contains("missing splits", ignoreCase = true) ->
+                InstallState.Failure(
+                    "MISSING_SPLITS",
+                    "The original app is installed with split APKs.",
+                    "Install the .apks container from Patched Files — it includes " +
+                            "base + all splits. Uninstall the original app first: " +
+                            "the signature changed.",
+                    true
+                )
+
+            /*
+             * Package verifier rejected the APK after it parsed cleanly —
+             * usually the unknown signing certificate. Uninstall-first
+             * resolves the signature conflict; Play Protect is the fallback.
+             */
+            msg.contains("VERIFICATION_FAILURE", ignoreCase = true) ->
+                InstallState.Failure(
+                    "INSTALL_FAILED_VERIFICATION_FAILURE",
+                    "System package verifier rejected the APK.",
+                    "The build is structurally valid — the verifier blocked it. " +
+                            "Uninstall the original app first (different signature), " +
+                            "then install the patched file. If it persists, disable " +
+                            "Play Protect scanning and retry.",
+                    true
+                )
+
+            status == PackageInstaller.STATUS_SUCCESS ->
                 InstallState.Success
-            PackageInstaller.STATUS_FAILURE_INVALID ->
+
+            status == PackageInstaller.STATUS_FAILURE_INVALID ->
                 InstallState.Failure("INSTALL_FAILURE_INVALID",
                     "Invalid APK — signature or structure is corrupt.",
                     "The signing block may be malformed.", true)
-            PackageInstaller.STATUS_FAILURE_CONFLICT ->
+
+            status == PackageInstaller.STATUS_FAILURE_CONFLICT ->
                 InstallState.Failure("INSTALL_FAILURE_CONFLICT",
                     "Version conflict — uninstall the original first.",
-                    message ?: "A different version is already installed.", false)
-            PackageInstaller.STATUS_FAILURE_BLOCKED ->
+                    msg.ifEmpty { "A different version is already installed." }, false)
+
+            status == PackageInstaller.STATUS_FAILURE_BLOCKED ->
                 InstallState.Failure("INSTALL_FAILURE_BLOCKED",
                     "Installation blocked.",
                     "Enable 'Install unknown apps' for AzlukPatcher in Settings.", false)
-            PackageInstaller.STATUS_FAILURE_STORAGE ->
+
+            status == PackageInstaller.STATUS_FAILURE_STORAGE ->
                 InstallState.Failure("INSTALL_FAILURE_STORAGE",
                     "Not enough storage space.", "Free up space and try again.", false)
+
             else ->
                 InstallState.Failure("INSTALL_FAILURE_$status",
-                    message ?: "Unknown installer error (code $status)",
+                    msg.ifEmpty { "Unknown installer error (code $status)" },
                     "Unexpected installer error.", true)
         }
         _state.update { it.copy(installState = ist) }
