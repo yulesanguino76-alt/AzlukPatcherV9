@@ -1054,7 +1054,7 @@ class ApkEngine(
                     apk.relativeTo(extracted)
 
                 val destination =
-                    File(patchedDir, relativePath)
+                    File(patchedDir, relativePath.path)
 
                 destination.parentFile?.mkdirs()
 
@@ -1084,7 +1084,7 @@ class ApkEngine(
                     file.relativeTo(extracted)
 
                 val destination =
-                    File(patchedDir, relativePath)
+                    File(patchedDir, relativePath.path)
 
                 destination.parentFile?.mkdirs()
 
