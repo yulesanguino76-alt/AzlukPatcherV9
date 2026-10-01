@@ -3,7 +3,7 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
-// Load local.properties for secrets
+// Load local.properties for secrets (NEVER committed to git)
 def localProps = new Properties()
 def localPropsFile = rootProject.file('local.properties')
 if (localPropsFile.exists()) {
@@ -21,31 +21,33 @@ android {
         versionCode 9
         versionName "9.0"
 
-        // ── TokenRouter config ────────────────────────────────────────────────
-        // Set in local.properties (never commit this file) or GitHub Actions secrets.
+        // ── TokenRouter config ────────────────────────────────────────────
+        // Priority: local.properties  >  environment variable  >  empty
         //
-        // local.properties:
-        //   TOKENROUTER_API_KEY=sk-ftEt...
-        //   TOKENROUTER_MODEL=anthropic/claude-3-5-sonnet   (or any of 300+ models)
+        // local.properties (in project root, gitignored):
+        //   TOKENROUTER_API_KEY=sk-tu-key-nueva
+        //   TOKENROUTER_MODEL=anthropic/claude-3-5-sonnet
         //   TOKENROUTER_BASE_URL=https://api.tokenrouter.com/v1
         //
-        // GitHub Actions: add TOKENROUTER_API_KEY as a repo secret, then pass:
-        //   ./gradlew assembleDebug -PTOKENROUTER_API_KEY=${{ secrets.TOKENROUTER_API_KEY }}
-
-        def trKey  = localProps.getProperty('TOKENROUTER_API_KEY', '')
-                  ?: System.getenv('TOKENROUTER_API_KEY') ?: 'sk-mVxY9BETs4r8DyWq86H2Xwjl7gUNTRFYQvxCGeZKrxnXVJ1v'
+        // GitHub Actions: add TOKENROUTER_API_KEY as a repo secret;
+        // the env var is picked up automatically by this build script.
+        //
+        // Empty key = AI diagnostics fall back to the offline expert
+        // system (localDiagnosis) — the app still builds and works.
+        def trKey = localProps.getProperty('TOKENROUTER_API_KEY', '')
+                ?: System.getenv('TOKENROUTER_API_KEY') ?: ''
         def trModel = localProps.getProperty('TOKENROUTER_MODEL', '')
-                  ?: System.getenv('TOKENROUTER_MODEL') ?: 'anthropic/claude-opus-5.5'
-        def trBase  = localProps.getProperty('TOKENROUTER_BASE_URL', '')
-                  ?: System.getenv('TOKENROUTER_BASE_URL') ?: 'https://api.tokenrouter.com/v1'
+                ?: System.getenv('TOKENROUTER_MODEL') ?: 'anthropic/claude-3-5-sonnet'
+        def trBase = localProps.getProperty('TOKENROUTER_BASE_URL', '')
+                ?: System.getenv('TOKENROUTER_BASE_URL') ?: 'https://api.tokenrouter.com/v1'
 
-        buildConfigField "String", "TOKENROUTER_API_KEY",  "\"$trKey\""
-        buildConfigField "String", "TOKENROUTER_MODEL",    "\"$trModel\""
+        buildConfigField "String", "TOKENROUTER_API_KEY", "\"$trKey\""
+        buildConfigField "String", "TOKENROUTER_MODEL", "\"$trModel\""
         buildConfigField "String", "TOKENROUTER_BASE_URL", "\"$trBase\""
     }
 
     buildTypes {
-        debug   { debuggable true; minifyEnabled false }
+        debug { debuggable true; minifyEnabled false }
         release { minifyEnabled false }
     }
 
@@ -57,8 +59,8 @@ android {
     kotlinOptions { jvmTarget = '17' }
 
     buildFeatures {
-        compose     true
-        buildConfig true   // needed for BuildConfig.ANTHROPIC_API_KEY
+        compose true
+        buildConfig true // needed for BuildConfig.TOKENROUTER_*
     }
 
     composeOptions {
@@ -81,10 +83,12 @@ dependencies {
     implementation 'androidx.compose.ui:ui-tooling-preview'
     implementation 'androidx.compose.material3:material3'
     implementation 'androidx.compose.material:material-icons-extended'
+
     implementation 'androidx.activity:activity-compose:1.8.2'
     implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0'
     implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.7.0'
     implementation 'androidx.navigation:navigation-compose:2.7.6'
+
     implementation 'androidx.core:core-ktx:1.12.0'
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.android.tools.build:apksig:8.2.2'
