@@ -22,24 +22,29 @@ android {
         versionName "9.0"
 
         // ── TokenRouter config ────────────────────────────────────────────
-        // Priority: local.properties  >  environment variable  >  empty
         //
-        // local.properties (in project root, gitignored):
-        //   TOKENROUTER_API_KEY=sk-tu-key-nueva
-        //   TOKENROUTER_MODEL=anthropic/claude-3-5-sonnet
-        //   TOKENROUTER_BASE_URL=https://api.tokenrouter.com/v1
+        // Resolution order (first NON-EMPTY wins):
+        //   1. Environment variable  — CI/GitHub Actions secrets
+        //   2. local.properties      — local dev only (gitignored)
+        //   3. Built-in default
         //
-        // GitHub Actions: add TOKENROUTER_API_KEY as a repo secret;
-        // the env var is picked up automatically by this build script.
-        //
-        // Empty key = AI diagnostics fall back to the offline expert
-        // system (localDiagnosis) — the app still builds and works.
-        def trKey = localProps.getProperty('TOKENROUTER_API_KEY', '')
-                ?: System.getenv('TOKENROUTER_API_KEY') ?: ''
-        def trModel = localProps.getProperty('TOKENROUTER_MODEL', '')
-                ?: System.getenv('TOKENROUTER_MODEL') ?: 'anthropic/claude-3-5-sonnet'
-        def trBase = localProps.getProperty('TOKENROUTER_BASE_URL', '')
-                ?: System.getenv('TOKENROUTER_BASE_URL') ?: 'https://api.tokenrouter.com/v1'
+        // NOTE: an empty-string default from getProperty() short-circuits
+        // the Elvis operator, so env vars must be probed EXPLICITLY or
+        // Actions secrets would silently never reach BuildConfig.
+        def trKey = [
+                System.getenv('TOKENROUTER_API_KEY'),
+                localProps.getProperty('TOKENROUTER_API_KEY')
+        ].find { it } ?: ''
+
+        def trModel = [
+                System.getenv('TOKENROUTER_MODEL'),
+                localProps.getProperty('TOKENROUTER_MODEL')
+        ].find { it } ?: 'openai/gpt-oss-20b'
+
+        def trBase = [
+                System.getenv('TOKENROUTER_BASE_URL'),
+                localProps.getProperty('TOKENROUTER_BASE_URL')
+        ].find { it } ?: 'https://api.groq.com/openai/v1'
 
         buildConfigField "String", "TOKENROUTER_API_KEY", "\"$trKey\""
         buildConfigField "String", "TOKENROUTER_MODEL", "\"$trModel\""
