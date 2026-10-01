@@ -285,6 +285,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
                     _state.update {
                         it.copy(patchState = PatchState.Failure(e.message ?: "Unknown error", log.toList()))
                     }
+                    analyzePatchFailure(e, log.toList())
                 }
             )
         }
@@ -309,7 +310,35 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ── Install result + AzlukAI ───────────────────────────────────────────────
+    // ── AI diagnosis ───────────────────────────────────────────────────────────
+
+    /**
+     * Feeds the actual patch log + exception to the AI so patch-time
+     * failures get a pipeline-stage diagnosis (install failures are
+     * covered by diagnoseWithAi).
+     */
+    private fun analyzePatchFailure(e: Throwable, log: List<String>) {
+        _state.update { it.copy(aiDiagnosis = AiDiagnosis(loading = true)) }
+        viewModelScope.launch {
+            val result = AzlukAI.analyzePatchLog(
+                error = e.message ?: "Unknown error",
+                logLines = log
+            )
+            _state.update {
+                if (!result.success && result.error == "not_configured") {
+                    it.copy(aiDiagnosis = AiDiagnosis(
+                        error = "AI sin configurar — define TOKENROUTER_API_KEY en build.gradle"
+                    ))
+                } else {
+                    it.copy(aiDiagnosis = AiDiagnosis(
+                        loading    = false,
+                        suggestion = if (result.success) result.suggestion else "",
+                        error      = if (!result.success) result.error else ""
+                    ))
+                }
+            }
+        }
+    }
 
     fun onInstallResult(status: Int, message: String?) {
         val msg = message ?: ""
@@ -318,7 +347,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
             /*
              * Finsky rejects installing a lone base.apk as an update of a
              * package that was installed with split APKs. The build is
-             * valid — the container (.apks) must be installed instead.
+             * valid — the .apks container must be installed instead.
              */
             msg.contains("missing splits", ignoreCase = true) ->
                 InstallState.Failure(
