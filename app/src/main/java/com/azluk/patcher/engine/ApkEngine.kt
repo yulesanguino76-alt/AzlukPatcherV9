@@ -42,6 +42,12 @@ import java.util.zip.ZipOutputStream
  * Alignment is computed from an exact byte counter flushed after every
  * entry: an offset that is off by one byte makes Android 12+ reject the
  * APK with a package parse error at install time.
+ *
+ * Split-aware patching: an app installed from Play with split APKs
+ * (base__abi, base__density, ...) MUST be patched and reinstalled as a
+ * full split set. Installing a lone base.apk as an update is rejected by
+ * the package verifier (INSTALL_FAILED_VERIFICATION_FAILURE, missing
+ * splits), so patch() emits a .apks container in that case.
  */
 class ApkEngine(
     private val ctx: Context
@@ -77,7 +83,6 @@ class ApkEngine(
     private class CountingOutputStream(
         out: OutputStream
     ) : FilterOutputStream(out) {
-
         var count: Long = 0
             private set
 
@@ -171,24 +176,59 @@ class ApkEngine(
         return scanFile(apk)
     }
 
+    /**
+     * Split-aware patch entry point.
+     *
+     * If the installed package carries split APKs, the whole set is
+     * patched with the same key and packed into one .apks container —
+     * installing only the base as an update is rejected by the package
+     * verifier because the original was installed with splits.
+     */
     fun patch(
         pkg: String,
         patches: List<PatchType>,
         progress: Progress
     ): File {
-        val input = File(
-            ctx.packageManager
-                .getApplicationInfo(pkg, 0)
-                .sourceDir
+        val info =
+            ctx.packageManager.getApplicationInfo(pkg, 0)
+
+        val base =
+            File(info.sourceDir)
+
+        val splits =
+            (info.splitSourceDirs ?: emptyArray())
+                .map { File(it) }
+                .filter { it.exists() }
+
+        if (splits.isEmpty()) {
+            emit(progress, "Single-APK install — no splits")
+
+            val output =
+                File(
+                    StorageUtils.getPatchedDir(),
+                    "${pkg}_azluk.apk"
+                )
+
+            patchToDisk(base, output, patches, progress)
+
+            return output
+        }
+
+        emit(
+            progress,
+            "Installed with ${splits.size} split APKs — " +
+                    "patching full split set"
         )
 
-        val output = File(
-            StorageUtils.getPatchedDir(),
-            "${pkg}_azluk.apk"
-        )
+        val output =
+            File(
+                StorageUtils.getPatchedDir(),
+                "${pkg}_azluk.apks"
+            )
 
-        patchToDisk(
-            input,
+        patchInstalledWithSplits(
+            base,
+            splits,
             output,
             patches,
             progress
@@ -333,7 +373,7 @@ class ApkEngine(
             }
         }
 
-                if (apkCount == 0) {
+        if (apkCount == 0) {
             throw IOException(
                 "Container contains no APK files"
             )
@@ -381,12 +421,15 @@ class ApkEngine(
             val entries = stageApk(input, staged, progress)
 
             emit(progress, "Phase 2/6 — transforming entries")
+
             transformEntries(entries, patches, progress)
 
             emit(progress, "Phase 3/6 — repacking and aligning")
+
             repack(entries, unsigned)
 
             emit(progress, "Phase 4/6 — signing")
+
             signer.signApk(unsigned, signed)
 
             emit(progress, "Phase 5/6 — verifying signature")
@@ -410,6 +453,7 @@ class ApkEngine(
             )
 
             emit(progress, "Phase 6/6 — publishing atomically")
+
             atomicPublish(signed, output)
 
             emit(
@@ -418,6 +462,92 @@ class ApkEngine(
             )
         } finally {
             workRoot.deleteRecursively()
+        }
+    }
+
+    /**
+     * Patches base + every split with the same key and packs them into
+     * one .apks container. Every split must be included: a split set
+     * with missing members does not install as an update.
+     */
+    private fun patchInstalledWithSplits(
+        base: File,
+        splits: List<File>,
+        output: File,
+        patches: List<PatchType>,
+        progress: Progress
+    ): File {
+        output.parentFile?.mkdirs()
+
+        val staging = File(
+            ctx.cacheDir,
+            "azluk-v9-splits-${System.nanoTime()}"
+        )
+
+        staging.mkdirs()
+
+        try {
+            val parts =
+                LinkedHashMap<String, File>()
+
+            val members =
+                listOf("base.apk" to base) +
+                        splits.map { it.name to it }
+
+            members.forEachIndexed { index, member ->
+                val name = member.first
+                val input = member.second
+
+                emit(
+                    progress,
+                    "[$name] (${index + 1}/${members.size})"
+                )
+
+                val signed =
+                    File(staging, "$name.signed")
+
+                patchToDisk(
+                    input,
+                    signed,
+                    patches,
+                    progress
+                )
+
+                parts[name] = signed
+            }
+
+            emit(progress, "Assembling .apks container")
+
+            ZipOutputStream(
+                BufferedOutputStream(
+                    FileOutputStream(output),
+                    BUFFER_SIZE
+                )
+            ).use { zip ->
+                zip.setComment("Patched by AzlukPatcher V9")
+
+                for (part in parts) {
+                    zip.putNextEntry(
+                        ZipEntry(part.key)
+                    )
+
+                    FileInputStream(part.value).use {
+                        it.copyTo(zip, BUFFER_SIZE)
+                    }
+
+                    zip.closeEntry()
+                }
+            }
+
+            emit(
+                progress,
+                "[SUCCESS] ${output.name} " +
+                        "(${formatSize(output.length())})"
+            )
+
+            return output
+        } finally {
+            staging.deleteRecursively()
         }
     }
 
@@ -644,10 +774,10 @@ class ApkEngine(
          * After every closeEntry() the counting stream holds EXACTLY the
          * number of bytes written so far, so counting.count is the file
          * offset where the next local file header will start. Alignment
-         * extras computed from it are byte-perfect — the old
-         * approximateOffset (uncompressed size for DEFLATED entries)
-         * produced misaligned resources.arsc, and Android 12+ rejects
-         * such APKs with a package parse error.
+         * extras computed from it are byte-perfect — an approximation
+         * (uncompressed size for DEFLATED entries) produced misaligned
+         * resources.arsc, and Android 12+ rejects such APKs with a
+         * package parse error.
          */
         val counting = CountingOutputStream(
             FileOutputStream(output)
@@ -666,6 +796,7 @@ class ApkEngine(
                 }
 
                 val dataIsStored = shouldStore(entry.name)
+
                 val entryNameBytes =
                     entry.name.toByteArray(StandardCharsets.UTF_8)
 
@@ -679,7 +810,6 @@ class ApkEngine(
                     zipEntry.size = size
                     zipEntry.compressedSize = size
                     zipEntry.crc = crc
-
                     zipEntry.extra = createAlignmentExtra(
                         counting.count,
                         entryNameBytes.size,
@@ -738,6 +868,7 @@ class ApkEngine(
         }
 
         val dataLength = extraLength - 4
+
         val extra = ByteArray(extraLength)
 
         extra[0] = 0x99.toByte()
@@ -798,7 +929,9 @@ class ApkEngine(
 
             for (apk in apkFiles) {
                 val relativePath = apk.relativeTo(extracted)
-                val destination = File(patchedDir, relativePath.path)
+
+                val destination =
+                    File(patchedDir, relativePath.path)
 
                 destination.parentFile?.mkdirs()
 
@@ -813,7 +946,9 @@ class ApkEngine(
 
             for (file in unchanged) {
                 val relativePath = file.relativeTo(extracted)
-                val destination = File(patchedDir, relativePath.path)
+
+                val destination =
+                    File(patchedDir, relativePath.path)
 
                 destination.parentFile?.mkdirs()
 
@@ -856,9 +991,7 @@ class ApkEngine(
                     destination.mkdirs()
                 } else {
                     destination.parentFile?.mkdirs()
-
                     copyZipEntryToFile(zip, destination)
-
                     result.add(destination)
                 }
 
@@ -893,6 +1026,7 @@ class ApkEngine(
                     .replace(File.separatorChar, '/')
 
                 val entry = ZipEntry(name)
+
                 entry.method = ZipEntry.DEFLATED
 
                 zip.putNextEntry(entry)
@@ -916,7 +1050,6 @@ class ApkEngine(
         apk: File
     ): List<ScanResult> {
         val result = ArrayList<ScanResult>()
-
         var dexIndex = 0
 
         ZipInputStream(
@@ -1013,7 +1146,11 @@ class ApkEngine(
                 )
             }
 
-            out.write(buffer, 0, read)
+            out.write(
+                buffer,
+                0,
+                read
+            )
         }
 
         return out.toByteArray()
@@ -1131,17 +1268,25 @@ class ApkEngine(
 
     private fun formatSize(bytes: Long): String {
         return when {
-            bytes < 1024 -> "$bytes B"
+            bytes < 1024 ->
+                "$bytes B"
 
             bytes < 1024L * 1024L ->
-                "%.1f KB".format(bytes / 1024.0)
+                "%.1f KB".format(
+                    bytes / 1024.0
+                )
 
             bytes < 1024L * 1024L * 1024L ->
-                "%.1f MB".format(bytes / (1024.0 * 1024.0))
+                "%.1f MB".format(
+                    bytes /
+                            (1024.0 * 1024.0)
+                )
 
             else ->
-                "%.2f GB".format(bytes / (1024.0 * 1024.0 * 1024.0))
+                "%.2f GB".format(
+                    bytes /
+                            (1024.0 * 1024.0 * 1024.0)
+                )
         }
     }
 }
-
