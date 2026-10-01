@@ -576,18 +576,56 @@ public final class SuperDexPatcher {
         return keys;
     }
 
-    public static Set<String> scanMarkers(byte[] data) {
+        /**
+     * Layer 1 only: recipes with a REAL working patch (exact descriptor +
+     * method + return-type guard). No marker substrings. PATCHABLE status
+     * is derived exclusively from this — every hit is a verified patch.
+     */
+    public static Set<String> scanStructuralKeys(byte[] dex) {
+        DexFile file = new DexFile(dex);
+        file.validate();
+
         Set<String> keys = new HashSet<>();
 
-        for (String[] marker : MARKERS) {
-            if (containsBytes(data, marker[1].getBytes(
-                    java.nio.charset.StandardCharsets.UTF_8))) {
-                keys.add(marker[0]);
+        for (Recipe recipe : RECIPES) {
+            if (containsRecipeTarget(file, recipe)) {
+                keys.add(recipe.key);
             }
         }
 
         return keys;
     }
+
+    /**
+     * Marker bytes precompiled once — the old loop re-encoded every
+     * pattern via getBytes() for every DEX of every APK (pure waste).
+     */
+    private static final byte[][] MARKER_BYTES = buildMarkerBytes();
+
+    private static byte[][] buildMarkerBytes() {
+        byte[][] out = new byte[MARKERS.length][];
+
+        for (int i = 0; i < MARKERS.length; i++) {
+            out[i] = MARKERS[i][1].getBytes(
+                    java.nio.charset.StandardCharsets.UTF_8
+            );
+        }
+
+        return out;
+    }
+
+    public static Set<String> scanMarkers(byte[] data) {
+        Set<String> keys = new HashSet<>();
+
+        for (int i = 0; i < MARKERS.length; i++) {
+            if (containsBytes(data, MARKER_BYTES[i])) {
+                keys.add(MARKERS[i][0]);
+            }
+        }
+
+        return keys;
+    }
+
 
     public static List<String[]> quickScan(InputStream input) throws IOException {
         byte[] data = readAll(input);
@@ -950,12 +988,26 @@ public final class SuperDexPatcher {
             boolean invoke =
                     (op >= 0x6e && op <= 0x72) ||
                     (op >= 0x74 && op <= 0x78);
+            for (EncodedMethod method : data.methods) {
+                MethodInfo info = file.getMethodInfo(method.methodIndex);
 
-            if (!invoke || u + 1 >= code.insnsSize) {
-                continue;
+                if (!recipe.matchesMethod(info.name)) {
+                    continue;
+                }
+
+                /*
+                 * Return-type guard: a structural hit must be a method
+                 * the patcher would ACTUALLY stub, or PATCHABLE would
+                 * overpromise (overload with a non-void return exists).
+                 */
+                if (recipe.expectedReturnType != null &&
+                        !recipe.expectedReturnType.equals(
+                                info.returnDescriptor)) {
+                    continue;
+                }
+
+                return true;
             }
-
-            int target = readU16(data, code.insnsOffset + (u + 1) * 2);
 
             if (methodIds.contains(target)) {
                 return true;
