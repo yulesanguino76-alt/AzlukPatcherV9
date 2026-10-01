@@ -39,9 +39,13 @@ import java.util.zip.Adler32;
  *  - recomputes SHA-1 + Adler32 only after successful mutation, then
  *    re-validates the output before returning it
  *
- * Detection = union of:
- *   1. structural descriptor presence in type_ids (from RECIPES)
- *   2. SDK marker substrings (V8-compatible badge layer)
+ * Detection (two layers, consumed by ApkEngine.classify):
+ *   1. scanStructuralKeys — recipes with a REAL working patch
+ *      (exact descriptor + method + return-type guard).
+ *      >= 1 hit => PATCHABLE.
+ *   2. scanMarkers — SDK substring badge layer.
+ *      0 structural + >= 3 marker categories => COMPLEX,
+ *      0 structural + 0-2 categories => LIKELY.
  * A detection hit means AVAILABLE. Keys without a safe structural
  * recipe no-op with a loud log — detection can never corrupt a DEX.
  */
@@ -576,7 +580,7 @@ public final class SuperDexPatcher {
         return keys;
     }
 
-        /**
+    /**
      * Layer 1 only: recipes with a REAL working patch (exact descriptor +
      * method + return-type guard). No marker substrings. PATCHABLE status
      * is derived exclusively from this — every hit is a verified patch.
@@ -625,7 +629,6 @@ public final class SuperDexPatcher {
 
         return keys;
     }
-
 
     public static List<String[]> quickScan(InputStream input) throws IOException {
         byte[] data = readAll(input);
@@ -708,7 +711,7 @@ public final class SuperDexPatcher {
 
             System.arraycopy(digest, 0, dex, 12, digest.length);
 
-                        Adler32 adler = new Adler32();
+            Adler32 adler = new Adler32();
 
             adler.update(dex, 12, dex.length - 12);
 
@@ -988,26 +991,12 @@ public final class SuperDexPatcher {
             boolean invoke =
                     (op >= 0x6e && op <= 0x72) ||
                     (op >= 0x74 && op <= 0x78);
-            for (EncodedMethod method : data.methods) {
-                MethodInfo info = file.getMethodInfo(method.methodIndex);
 
-                if (!recipe.matchesMethod(info.name)) {
-                    continue;
-                }
-
-                /*
-                 * Return-type guard: a structural hit must be a method
-                 * the patcher would ACTUALLY stub, or PATCHABLE would
-                 * overpromise (overload with a non-void return exists).
-                 */
-                if (recipe.expectedReturnType != null &&
-                        !recipe.expectedReturnType.equals(
-                                info.returnDescriptor)) {
-                    continue;
-                }
-
-                return true;
+            if (!invoke || u + 1 >= code.insnsSize) {
+                continue;
             }
+
+            int target = readU16(data, code.insnsOffset + (u + 1) * 2);
 
             if (methodIds.contains(target)) {
                 return true;
@@ -1043,9 +1032,22 @@ public final class SuperDexPatcher {
             for (EncodedMethod method : data.methods) {
                 MethodInfo info = file.getMethodInfo(method.methodIndex);
 
-                if (recipe.matchesMethod(info.name)) {
-                    return true;
+                if (!recipe.matchesMethod(info.name)) {
+                    continue;
                 }
+
+                /*
+                 * Return-type guard: a structural hit must be a method
+                 * the patcher would ACTUALLY stub, or PATCHABLE would
+                 * overpromise (overload with a non-void return exists).
+                 */
+                if (recipe.expectedReturnType != null &&
+                        !recipe.expectedReturnType.equals(
+                                info.returnDescriptor)) {
+                    continue;
+                }
+
+                return true;
             }
         }
 
@@ -1614,7 +1616,7 @@ public final class SuperDexPatcher {
         data[attributeOffset + 15] = TYPE_INT_BOOLEAN;
         writeU32(data, attributeOffset + 16, value ? 1 : 0);
     }
-
+    
     // -------------------------------------------------------------------------
     // DEX file model
     // -------------------------------------------------------------------------
@@ -2192,6 +2194,16 @@ public final class SuperDexPatcher {
                 ((data[offset + 3] & 0xff) << 24);
     }
 
+    /**
+     * Short-form u32 reader used by the AXML attribute walkers
+     * (patchStartElement / scanStartElement). Identical bounds
+     * checking to readU32Checked — this alias exists so both
+     * call styles resolve; DexFile.readU32(int) is unrelated.
+     */
+    private static int readU32(byte[] data, int offset) {
+        return readU32Checked(data, offset);
+    }
+
     private static void writeU16(byte[] data, int offset, int value) {
         checkRange(offset, 2, data.length, "u16 write");
 
@@ -2262,4 +2274,3 @@ public final class SuperDexPatcher {
         }
     }
 }
-
