@@ -119,7 +119,7 @@ fun SplashScreen(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically) {
                 Surface(color = AzlukBlue, shape = RoundedCornerShape(5.dp)) {
-                    Text("V8", color = Color.White, fontSize = 11.sp,
+                    Text("V9", color = Color.White, fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp))
                 }
