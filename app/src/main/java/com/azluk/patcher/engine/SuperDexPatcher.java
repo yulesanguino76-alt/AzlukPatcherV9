@@ -3,6 +3,7 @@ package com.azluk.patcher.engine;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -19,17 +20,7 @@ import java.util.zip.Adler32;
  * DEX parser/transformer, failure-loud by design:
  *
  *  - validates the DEX header before reading tables
- *  - uses the real DEX offsets from the specification:
- *
- *      header:    string_ids_size @ 0x38, string_ids_off @ 0x3C
- *                 class_defs_size @ 0x60, class_defs_off @ 0x64
- *
- *      proto_id:  shorty_idx u32 @ +0
- *                 return_type_idx u32 @ +4
- *                 parameters_off u32 @ +8
- *
- *  - cross-validates proto shorty against the return descriptor and
- *    refuses the file on mismatch
+ *  - uses the real DEX offsets from the specification
  *  - decodes DEX strings as strict MUTF-8
  *  - resolves methods structurally through class_defs -> class_data ->
  *    method_ids -> name_idx -> string_ids; never through const-string scans
@@ -37,13 +28,24 @@ import java.util.zip.Adler32;
  *  - refuses methods with exception handlers (tries_size != 0)
  *  - recomputes SHA-1 + Adler32 only after successful mutation
  *
- * Detection:
- *  - DEX level: exact descriptor presence in type_ids (DETECTORS map,
- *    built generically from RECIPES so every recipe key is auto-detected)
- *  - Manifest level: AXML attribute walk resolved through the resource map
+ * DETECTION has two layers, unioned:
  *
- * Recipes are structural (class descriptor + method name + expected
- * return type), exact-matched against type_ids — no substring matching.
+ *  1. Structural: exact descriptor presence in type_ids (DETECTORS map,
+ *     built generically from RECIPES).
+ *
+ *  2. Marker scan (V8-compatible): UTF-8 byte substrings that only exist
+ *     in a DEX when the corresponding SDK is linked in — class descriptors
+ *     and well-known constant names live verbatim in the string pool.
+ *     A marker hit means the patch is AVAILABLE, nothing more.
+ *
+ * PATCHING stays strict regardless of detection: every candidate is
+ * re-verified structurally (exact descriptor + exact method + return
+ * guard), and keys without a structural recipe no-op with a loud log
+ * line — a detection hit can never corrupt a DEX.
+ *
+ * STUBS are type-aware AND verdict-aware: return-void, const/4 + return
+ * for primitives (with a configurable stubValue — 0 == OK/SUCCESS/false,
+ * 1 == true), null object returns, and zero wide returns.
  */
 public final class SuperDexPatcher {
 
@@ -81,8 +83,67 @@ public final class SuperDexPatcher {
     }
 
     /**
+     * Marker table — V8-compatible detection layer.
+     *
+     * marker -> patch key. Markers are ASCII substrings of MUTF-8 DEX
+     * strings, so they appear verbatim as bytes in the file.
+     */
+    private static final String[][] MARKERS = {
+            /* Licensing */
+            { "LICENSE_BYPASS",      "ILicensingService" },
+            { "LICENSE_BYPASS",      "com/google/android/vending/licensing" },
+            { "LICENSE_BYPASS",      "LICENSED" },
+
+            /* Play Billing */
+            { "IAP_BYPASS",          "com/android/vending/billing" },
+            { "IAP_BYPASS",          "BillingClient" },
+            { "IAP_BYPASS",          "PURCHASED" },
+
+            /* Signature checks */
+            { "SIGNATURE_BYPASS",    "getSignatures" },
+            { "SIGNATURE_BYPASS",    "GET_SIGNATURES" },
+            { "SIGNATURE_BYPASS",    "signingInfo" },
+
+            /* Ad SDKs */
+            { "REMOVE_ADS",          "com/google/android/gms/ads" },
+            { "REMOVE_ADS",          "com/facebook/ads" },
+            { "REMOVE_ADS",          "com/unity3d/ads" },
+            { "REMOVE_ADS",          "com/applovin" },
+            { "REMOVE_ADS",          "com/ironsource" },
+            { "REMOVE_ADS",          "com/mopub" },
+            { "REMOVE_ADS",          "com/chartboost" },
+            { "REMOVE_ADS",          "com/vungle" },
+            { "REMOVE_ADS",          "com/inmobi" },
+
+            /* TLS pinning / trust managers */
+            { "SSL_BYPASS",          "CertificatePinner" },
+            { "SSL_BYPASS",          "checkServerTrusted" },
+            { "SSL_BYPASS",          "checkClientTrusted" },
+            { "SSL_BYPASS",          "javax/net/ssl/X509TrustManager" },
+
+            /* Root detection */
+            { "ROOT_BYPASS",         "isRooted" },
+            { "ROOT_BYPASS",         "RootBeer" },
+            { "ROOT_BYPASS",         "isDeviceRooted" },
+            { "ROOT_BYPASS",         "/system/xbin/su" },
+
+            /* Integrity attestation */
+            { "SAFETYNET_BYPASS",    "SafetyNet" },
+            { "SAFETYNET_BYPASS",    "com/google/android/play/core/integrity" },
+
+            /* Anti-Frida / anti-Xposed */
+            { "FRIDA_BYPASS",        "frida" },
+            { "FRIDA_BYPASS",        "XposedBridge" },
+            { "FRIDA_BYPASS",        "tracerpid" },
+
+            /* Screenshot blocking */
+            { "DISABLE_FLAG_SECURE", "FLAG_SECURE" }
+    };
+
+    /**
      * Structural recipes. Exact descriptor match, exact method name match,
-     * optional expected return type guard. First matching recipe wins.
+     * optional expected return type guard, configurable stub verdict.
+     * First matching recipe wins.
      */
     private static final List<Recipe> RECIPES;
 
@@ -143,8 +204,7 @@ public final class SuperDexPatcher {
 
         /*
          * Ads: modern GMA SDK (v20+). The entry-point classes moved into
-         * subpackages — banner/, interstitial/, appopen/, rewarded/. Apps
-         * built against recent play-services-ads only carry these.
+         * subpackages — banner/, interstitial/, appopen/, rewarded/.
          */
         recipes.add(new Recipe(
                 "REMOVE_ADS",
@@ -241,42 +301,109 @@ public final class SuperDexPatcher {
                 "V"));
 
         /*
-         * SSL pinning bypass (SSL_BYPASS). OkHttp entry points:
-         *  - CertificatePinner.check(...) is void; stubbing it turns every
-         *    pin check into a no-op (pin failure would throw).
-         *  - OkHostnameVerifier.verify(...) is boolean; stubbing it makes
-         *    hostname verification always pass.
+         * SSL pinning bypass (structural stubs).
+         *
+         *  - CertificatePinner.check -> void: pin verification no-ops.
+         *  - OkHostnameVerifier.verify -> boolean TRUE (stubValue=1):
+         *    hostname verification always passes. The value matters —
+         *    stubbing it to false would reject every TLS handshake.
          */
         recipes.add(new Recipe(
                 "SSL_BYPASS",
                 new String[]{ "Lokhttp3/CertificatePinner;" },
                 new String[]{ "check" },
-                "V"));
+                "V",
+                0));
 
         recipes.add(new Recipe(
                 "SSL_BYPASS",
                 new String[]{ "Lokhttp3/internal/tls/OkHostnameVerifier;" },
                 new String[]{ "verify" },
-                "Z"));
+                "Z",
+                1));
 
         /*
-         * Root detection bypass (ROOT_BYPASS). RootBeer's two public
-         * verdict methods are boolean; stubbing them returns false
-         * (const/4 v0, 0 + return) = "not rooted".
+         * Root detection bypass — every verdict method stubbed to
+         * boolean FALSE (stubValue=0) = "not rooted".
          */
         recipes.add(new Recipe(
                 "ROOT_BYPASS",
                 new String[]{ "Lcom/scottyab/rootbeer/RootBeer;" },
-                new String[]{ "isRooted", "isRootedWithoutBusyBoxCheck" },
-                "Z"));
+                new String[]{
+                        "isRooted",
+                        "isRootedWithoutBusyBoxCheck",
+                        "detectRootManagementApps",
+                        "detectPotentiallyDangerousApps",
+                        "detectTestKeys",
+                        "detectRootCloakingApps",
+                        "checkForBusyBoxBinary"
+                },
+                "Z",
+                0));
+
+        /*
+         * LICENSE_BYPASS — Play License Verification (LVL).
+         * checkAccess/verify are the two classic nullification points:
+         * void stubs mean the verdict callback never fires a denial.
+         */
+        recipes.add(new Recipe(
+                "LICENSE_BYPASS",
+                new String[]{ "Lcom/google/android/vending/licensing/LicenseChecker;" },
+                new String[]{ "checkAccess" },
+                "V"));
+
+        recipes.add(new Recipe(
+                "LICENSE_BYPASS",
+                new String[]{ "Lcom/google/android/vending/licensing/LicenseValidator;" },
+                new String[]{ "verify" },
+                "V"));
+
+        /*
+         * IAP_BYPASS — Play Billing. The stub returns 0, which IS
+         * BillingResponseCode.OK / BILLING_RESPONSE_RESULT_OK, so the
+         * int stub is semantically the bypass verdict itself.
+         */
+        recipes.add(new Recipe(
+                "IAP_BYPASS",
+                new String[]{ "Lcom/android/billingclient/api/BillingResult;" },
+                new String[]{ "getResponseCode" },
+                "I",
+                0));
+
+        recipes.add(new Recipe(
+                "IAP_BYPASS",
+                new String[]{ "Lcom/android/billingclient/api/Purchase$PurchasesResult;" },
+                new String[]{ "getResponseCode" },
+                "I",
+                0));
+
+        recipes.add(new Recipe(
+                "IAP_BYPASS",
+                new String[]{ "Lcom/android/vending/billing/IInAppBillingService$Stub$Proxy;" },
+                new String[]{ "isBillingSupported", "isBillingSupportedExtraParams" },
+                "I",
+                0));
+
+        /*
+         * GOOGLE_PLAY_BYPASS — availability gates. 0 == ConnectionResult
+         * .SUCCESS, so the int stub reports Play Services as available.
+         */
+        recipes.add(new Recipe(
+                "GOOGLE_PLAY_BYPASS",
+                new String[]{
+                        "Lcom/google/android/gms/common/GoogleApiAvailability;",
+                        "Lcom/google/android/gms/common/GoogleApiAvailabilityLight;",
+                        "Lcom/google/android/gms/common/GooglePlayServicesUtil;"
+                },
+                new String[]{ "isGooglePlayServicesAvailable" },
+                "I",
+                0));
 
         RECIPES = Collections.unmodifiableList(recipes);
     }
 
     /**
      * Exact-descriptor detectors, built generically from RECIPES.
-     * Adding a recipe above automatically makes its patch auto-detected —
-     * no second list to maintain, no keys left behind.
      */
     private static final Map<String, List<String>> DETECTORS;
 
@@ -469,11 +596,6 @@ public final class SuperDexPatcher {
 
     /**
      * Kept for source compatibility with the current ApkEngine.
-     *
-     * Domain blocking requires a true string-pool rebuild/relocation phase.
-     * The old destructive "blank the string in place" behavior corrupted
-     * sorted pools and class descriptors sharing the same data, so this
-     * method validates the input and refuses to fake success.
      */
     public static byte[] applyAdsDomainBlock(
             byte[] dex,
@@ -492,7 +614,7 @@ public final class SuperDexPatcher {
     // -------------------------------------------------------------------------
 
     /**
-     * DEX-level detection: exact descriptor presence in type_ids.
+     * Layer 1: exact descriptor presence in type_ids.
      * No substring matching, no byte scans.
      */
     public static Set<String> scanKeys(byte[] dex) {
@@ -519,12 +641,68 @@ public final class SuperDexPatcher {
         return keys;
     }
 
+    /**
+     * Layer 2: V8-compatible marker scan.
+     *
+     * SDK marker substrings anywhere in the DEX bytes. A hit means the
+     * SDK is linked into the app and its patch is AVAILABLE — the patch
+     * phase re-verifies structurally, so this can never cause corruption.
+     */
+    public static Set<String> scanMarkers(byte[] data) {
+        Set<String> keys = new HashSet<>();
+
+        for (String[] marker : MARKERS) {
+            if (containsBytes(data, marker[1])) {
+                keys.add(marker[0]);
+            }
+        }
+
+        return keys;
+    }
+
+    private static boolean containsBytes(byte[] data, String needle) {
+        byte[] pattern =
+                needle.getBytes(StandardCharsets.US_ASCII);
+
+        if (pattern.length == 0 || data.length < pattern.length) {
+            return false;
+        }
+
+        byte first = pattern[0];
+        int last = data.length - pattern.length;
+
+        outer:
+        for (int i = 0; i <= last; i++) {
+            if (data[i] != first) {
+                continue;
+            }
+
+            for (int j = 1; j < pattern.length; j++) {
+                if (data[i + j] != pattern[j]) {
+                    continue outer;
+                }
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
     public static List<String[]> quickScan(InputStream input) throws IOException {
         byte[] data = readAll(input);
 
+        /*
+         * Union of both detection layers:
+         *   1. exact descriptor presence in type_ids (structural)
+         *   2. SDK marker substrings anywhere in the DEX (V8-compatible)
+         */
+        Set<String> keys = scanKeys(data);
+        keys.addAll(scanMarkers(data));
+
         List<String[]> result = new ArrayList<>();
 
-        for (String key : scanKeys(data)) {
+        for (String key : keys) {
             result.add(new String[]{
                     key,
                     describeKey(key)
@@ -543,9 +721,23 @@ public final class SuperDexPatcher {
             case "REMOVE_TELEMETRY":
                 return "Telemetry SDK detected";
             case "SSL_BYPASS":
-                return "OkHttp certificate pinning detected";
+                return "TLS pinning / trust manager detected";
             case "ROOT_BYPASS":
-                return "RootBeer root detection detected";
+                return "Root detection detected";
+            case "SAFETYNET_BYPASS":
+                return "Integrity attestation detected";
+            case "FRIDA_BYPASS":
+                return "Frida / Xposed detection detected";
+            case "LICENSE_BYPASS":
+                return "Play Licensing detected";
+            case "IAP_BYPASS":
+                return "Play Billing detected";
+            case "SIGNATURE_BYPASS":
+                return "Signature check detected";
+            case "GOOGLE_PLAY_BYPASS":
+                return "Play Services availability gate detected";
+            case "DISABLE_FLAG_SECURE":
+                return "FLAG_SECURE usage detected";
             default:
                 return "Detected";
         }
@@ -847,7 +1039,8 @@ public final class SuperDexPatcher {
                         code.insnsOffset,
                         code.insnsSize,
                         code.registersSize,
-                        info.returnDescriptor
+                        info.returnDescriptor,
+                        recipe.stubValue
                 );
 
                 patched++;
@@ -865,49 +1058,6 @@ public final class SuperDexPatcher {
         }
 
         return patched;
-    }
-
-    private static boolean containsRecipeTarget(
-            DexFile file,
-            Recipe recipe
-    ) {
-        for (int classIndex = 0; classIndex < file.classDefsSize; classIndex++) {
-            int classDef = file.classDefsOff + classIndex * CLASS_DEF_SIZE;
-            int typeIndex = file.readU32(classDef);
-            String descriptor = file.getTypeDescriptor(typeIndex);
-
-            if (!recipe.matchesClass(descriptor)) {
-                continue;
-            }
-
-            int classDataOff = file.readU32(classDef + 24);
-
-            if (classDataOff == 0) {
-                continue;
-            }
-
-            checkRange(classDataOff, 1, file.bytes.length, "class_data");
-
-            ClassData data = parseClassData(file, file.bytes, classDataOff);
-
-            for (EncodedMethod method : data.methods) {
-                if ((method.accessFlags & (ACC_NATIVE | ACC_ABSTRACT)) != 0) {
-                    continue;
-                }
-
-                if (method.codeOffset == 0) {
-                    continue;
-                }
-
-                MethodInfo info = file.getMethodInfo(method.methodIndex);
-
-                if (recipe.matchesMethod(info.name)) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
     }
 
     private static Recipe findRecipe(
@@ -955,7 +1105,8 @@ public final class SuperDexPatcher {
             int offset,
             int insnsSize,
             int registersSize,
-            String returnType
+            String returnType,
+            int stubValue
     ) {
         if (insnsSize <= 0) {
             throw new IllegalArgumentException("Invalid zero-length method");
@@ -1003,11 +1154,12 @@ public final class SuperDexPatcher {
         }
 
         /*
-         * const/4 v0, #0 format 11n, A=0, B=0 => 0x0012
+         * const/4 v0, #literal — format 11n: opcode 0x12, register in A,
+         * 4-bit signed literal in B (bits 8-11). stubValue 0 or 1 fits.
          * return v0 => 0x000f
-         * return-object v0 => 0x0011 (object/array return types)
+         * return-object v0 => 0x0011 (object/array returns: null)
          */
-        writeU16(data, offset, 0x0012);
+        writeU16(data, offset, 0x0012 | ((stubValue & 0xF) << 8));
         writeU16(data, offset + 2, 0x000f);
 
         if (returnType.startsWith("L") || returnType.startsWith("[")) {
@@ -1849,6 +2001,7 @@ public final class SuperDexPatcher {
         final String[] classes;
         final String[] methods;
         final String expectedReturnType;
+        final int stubValue;
 
         Recipe(
                 String key,
@@ -1856,10 +2009,21 @@ public final class SuperDexPatcher {
                 String[] methods,
                 String expectedReturnType
         ) {
+            this(key, classes, methods, expectedReturnType, 0);
+        }
+
+        Recipe(
+                String key,
+                String[] classes,
+                String[] methods,
+                String expectedReturnType,
+                int stubValue
+        ) {
             this.key = key;
             this.classes = classes;
             this.methods = methods;
             this.expectedReturnType = expectedReturnType;
+            this.stubValue = stubValue;
         }
 
         boolean matchesClass(String descriptor) {
