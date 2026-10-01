@@ -2,7 +2,6 @@ package com.azluk.patcher.ui.screens
 
 import android.content.Intent
 import android.content.pm.ApplicationInfo
-import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
 import android.net.Uri
@@ -13,6 +12,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
@@ -28,7 +28,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
 import androidx.navigation.NavController
 import com.google.accompanist.drawablepainter.rememberDrawablePainter
+import com.azluk.patcher.core.ScanResult
+import com.azluk.patcher.core.PatchType
+import com.azluk.patcher.engine.ApkEngine
 import com.azluk.patcher.ui.theme.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
@@ -54,11 +59,17 @@ data class AppDetails(
     val icon: Drawable?
 )
 
+data class DetailScanUi(
+    val loading: Boolean = false,
+    val error: String? = null,
+    val results: List<ScanResult> = emptyList()
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DetailScreen(pkg: String, navController: NavController) {
     val ctx = LocalContext.current
-    val pm  = ctx.packageManager
+    val pm = ctx.packageManager
 
     val details = remember(pkg) {
         try {
@@ -68,27 +79,26 @@ fun DetailScreen(pkg: String, navController: NavController) {
                 PackageManager.GET_ACTIVITIES or
                 PackageManager.GET_SERVICES or
                 PackageManager.GET_RECEIVERS)
-
             AppDetails(
-                name        = pm.getApplicationLabel(ai).toString(),
-                pkg         = pkg,
-                version     = pi.versionName ?: "?",
+                name = pm.getApplicationLabel(ai).toString(),
+                pkg = pkg,
+                version = pi.versionName ?: "?",
                 versionCode = if (android.os.Build.VERSION.SDK_INT >= 28)
                     pi.longVersionCode else @Suppress("DEPRECATION") pi.versionCode.toLong(),
-                apkSize     = File(ai.sourceDir).length(),
+                apkSize = File(ai.sourceDir).length(),
                 installDate = pi.firstInstallTime,
-                updateDate  = pi.lastUpdateTime,
-                isSystem    = (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
-                isDebuggable= (ai.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0,
-                dataDir     = ai.dataDir ?: "N/A",
-                nativeLibDir= ai.nativeLibraryDir ?: "N/A",
-                targetSdk   = ai.targetSdkVersion,
-                minSdk      = if (android.os.Build.VERSION.SDK_INT >= 24) ai.minSdkVersion else 0,
+                updateDate = pi.lastUpdateTime,
+                isSystem = (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
+                isDebuggable = (ai.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0,
+                dataDir = ai.dataDir ?: "N/A",
+                nativeLibDir = ai.nativeLibraryDir ?: "N/A",
+                targetSdk = ai.targetSdkVersion,
+                minSdk = if (android.os.Build.VERSION.SDK_INT >= 24) ai.minSdkVersion else 0,
                 permissions = pi.requestedPermissions?.toList() ?: emptyList(),
-                activities  = pi.activities?.map { it.name.substringAfterLast(".") } ?: emptyList(),
-                services    = pi.services?.map { it.name.substringAfterLast(".") } ?: emptyList(),
-                receivers   = pi.receivers?.map { it.name.substringAfterLast(".") } ?: emptyList(),
-                icon        = try { pm.getApplicationIcon(ai) } catch (_: Exception) { null }
+                activities = pi.activities?.map { it.name.substringAfterLast(".") } ?: emptyList(),
+                services = pi.services?.map { it.name.substringAfterLast(".") } ?: emptyList(),
+                receivers = pi.receivers?.map { it.name.substringAfterLast(".") } ?: emptyList(),
+                icon = try { pm.getApplicationIcon(ai) } catch (_: Exception) { null }
             )
         } catch (e: Exception) { null }
     }
@@ -98,6 +108,21 @@ fun DetailScreen(pkg: String, navController: NavController) {
             Text("App not found", color = AzlukError)
         }
         return
+    }
+
+    // ── Live patch scan (the job this screen was missing) ─────────────────
+    val engine = remember(pkg) { ApkEngine(ctx) }
+    var scanUi by remember(pkg) { mutableStateOf(DetailScanUi()) }
+
+    LaunchedEffect(pkg) {
+        scanUi = DetailScanUi(loading = true)
+        val outcome = withContext(Dispatchers.IO) {
+            runCatching { engine.scan(pkg) }
+        }
+        scanUi = outcome.fold(
+            onSuccess = { DetailScanUi(results = it) },
+            onFailure = { DetailScanUi(error = it.message ?: "Scan failed") }
+        )
     }
 
     var activeTab by remember { mutableStateOf(0) }
@@ -114,13 +139,12 @@ fun DetailScreen(pkg: String, navController: NavController) {
                 },
                 navigationIcon = {
                     IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.Default.ArrowBack, null, tint = AzlukOnSurface)
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = AzlukOnSurface)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = AzlukSurface)
             )
         },
-        // Bottom sheet style action bar
         bottomBar = {
             Surface(
                 color = AzlukSurface,
@@ -133,7 +157,6 @@ fun DetailScreen(pkg: String, navController: NavController) {
                         .padding(12.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    // Launch
                     OutlinedButton(
                         onClick = {
                             try {
@@ -144,7 +167,7 @@ fun DetailScreen(pkg: String, navController: NavController) {
                             } catch (_: Exception) {}
                         },
                         modifier = Modifier.weight(1f),
-                        shape  = RoundedCornerShape(12.dp),
+                        shape = RoundedCornerShape(12.dp),
                         border = BorderStroke(1.dp, AzlukSurfaceVar)
                     ) {
                         Icon(Icons.Default.PlayArrow, null,
@@ -153,7 +176,6 @@ fun DetailScreen(pkg: String, navController: NavController) {
                         Text("Launch", color = AzlukSuccess, fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold)
                     }
-                    // App Settings
                     OutlinedButton(
                         onClick = {
                             ctx.startActivity(
@@ -162,7 +184,7 @@ fun DetailScreen(pkg: String, navController: NavController) {
                             )
                         },
                         modifier = Modifier.weight(1f),
-                        shape  = RoundedCornerShape(12.dp),
+                        shape = RoundedCornerShape(12.dp),
                         border = BorderStroke(1.dp, AzlukSurfaceVar)
                     ) {
                         Icon(Icons.Default.Settings, null,
@@ -171,11 +193,10 @@ fun DetailScreen(pkg: String, navController: NavController) {
                         Text("Settings", color = AzlukOnSurface, fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold)
                     }
-                    // Patch — main CTA
                     Button(
                         onClick = { navController.navigate("patch/$pkg") },
                         modifier = Modifier.weight(1.5f),
-                        shape  = RoundedCornerShape(12.dp),
+                        shape = RoundedCornerShape(12.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = AzlukBlue)
                     ) {
                         Icon(Icons.Default.Build, null, Modifier.size(16.dp))
@@ -191,7 +212,6 @@ fun DetailScreen(pkg: String, navController: NavController) {
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            // App header card with gradient
             Box(
                 Modifier
                     .fillMaxWidth()
@@ -201,7 +221,6 @@ fun DetailScreen(pkg: String, navController: NavController) {
                     .padding(16.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    // Icon
                     Box(
                         Modifier
                             .size(64.dp)
@@ -239,12 +258,11 @@ fun DetailScreen(pkg: String, navController: NavController) {
                 }
             }
 
-            // Tab row
-            val tabs = listOf("Info", "Permissions", "Components")
+            val tabs = listOf("Info", "Patches", "Permissions", "Components")
             TabRow(
                 selectedTabIndex = activeTab,
-                containerColor   = AzlukSurface,
-                contentColor     = AzlukBlue,
+                containerColor = AzlukSurface,
+                contentColor = AzlukBlue,
                 indicator = { tabPositions ->
                     TabRowDefaults.SecondaryIndicator(
                         Modifier.tabIndicatorOffset(tabPositions[activeTab]),
@@ -255,7 +273,7 @@ fun DetailScreen(pkg: String, navController: NavController) {
                 tabs.forEachIndexed { i, title ->
                     Tab(
                         selected = activeTab == i,
-                        onClick  = { activeTab = i },
+                        onClick = { activeTab = i },
                         text = {
                             Text(title, fontSize = 13.sp,
                                 color = if (activeTab == i) AzlukBlue else AzlukOnSurface)
@@ -264,14 +282,113 @@ fun DetailScreen(pkg: String, navController: NavController) {
                 }
             }
 
-            // Tab content
             when (activeTab) {
                 0 -> InfoTab(details, fmt)
-                1 -> PermissionsTab(details.permissions)
-                2 -> ComponentsTab(details)
+                1 -> PatchesTab(scanUi)
+                2 -> PermissionsTab(details.permissions)
+                3 -> ComponentsTab(details)
             }
         }
     }
+}
+
+@Composable
+private fun PatchesTab(ui: DetailScanUi) {
+    when {
+        ui.loading -> {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(Modifier.size(28.dp), color = AzlukBlue, strokeWidth = 2.5.dp)
+                    Spacer(Modifier.height(10.dp))
+                    Text("Scanning DEX + manifest…", color = AzlukOnSurface, fontSize = 12.sp)
+                }
+            }
+        }
+
+        ui.error != null -> {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Default.ErrorOutline, null,
+                        Modifier.size(32.dp), tint = AzlukError)
+                    Spacer(Modifier.height(8.dp))
+                    Text(ui.error, color = AzlukError, fontSize = 12.sp)
+                }
+            }
+        }
+
+        else -> {
+            val detected = ui.results.mapNotNull { r ->
+                runCatching { PatchType.valueOf(r.patchType) }.getOrNull()
+            }
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Surface(
+                    color = if (detected.isEmpty()) AzlukSurface else AzlukSuccess.copy(.08f),
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            if (detected.isEmpty()) Icons.Default.SearchOff else Icons.Default.CheckCircle,
+                            null, Modifier.size(18.dp),
+                            tint = if (detected.isEmpty()) AzlukOnSurface else AzlukSuccess
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            if (detected.isEmpty()) "No auto-detected patches"
+                            else "${detected.size} patches available",
+                            color = if (detected.isEmpty()) AzlukOnSurface else AzlukSuccess,
+                            fontWeight = FontWeight.SemiBold, fontSize = 13.sp
+                        )
+                    }
+                }
+
+                ui.results.forEach { r ->
+                    val type = runCatching { PatchType.valueOf(r.patchType) }.getOrNull()
+                    Surface(color = AzlukSurface, shape = RoundedCornerShape(10.dp)) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(type?.let { catColorFor(it) } ?: AzlukOnSurface)
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    type?.displayName ?: r.patchType,
+                                    color = AzlukOnBg, fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                r.desc?.let {
+                                    Text(it, color = AzlukOnSurface,
+                                        fontSize = 10.sp, maxLines = 2)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun catColorFor(type: PatchType): Color = when (type.category) {
+    "bypass"   -> AzlukBlue
+    "ads"      -> AzlukWarning
+    "security" -> AzlukError
+    "dev"      -> AzlukCyan
+    else       -> AzlukSuccess
 }
 
 @Composable
@@ -284,27 +401,21 @@ private fun InfoTab(d: AppDetails, fmt: SimpleDateFormat) {
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         InfoSection("Package Info") {
-            InfoRow2("Package",     d.pkg)
-            InfoRow2("Version",     "${d.version} (${d.versionCode})")
-            InfoRow2("APK Size",    fmtSize(d.apkSize))
-            InfoRow2("Target SDK",  "API ${d.targetSdk}")
-            InfoRow2("Min SDK",     "API ${d.minSdk}")
-            InfoRow2("Type",        if (d.isSystem) "System App" else "User App")
-            InfoRow2("Debuggable",  if (d.isDebuggable) "Yes" else "No")
+            InfoRow2("Package", d.pkg)
+            InfoRow2("Version", "${d.version} (${d.versionCode})")
+            InfoRow2("APK Size", fmtSize(d.apkSize))
+            InfoRow2("Target SDK", "API ${d.targetSdk}")
+            InfoRow2("Min SDK", "API ${d.minSdk}")
+            InfoRow2("Type", if (d.isSystem) "System App" else "User App")
+            InfoRow2("Debuggable", if (d.isDebuggable) "Yes" else "No")
         }
         InfoSection("Dates") {
-            InfoRow2("Installed",  fmt.format(Date(d.installDate)))
-            InfoRow2("Updated",    fmt.format(Date(d.updateDate)))
+            InfoRow2("Installed", fmt.format(Date(d.installDate)))
+            InfoRow2("Updated", fmt.format(Date(d.updateDate)))
         }
         InfoSection("Paths") {
-            InfoRow2("Data Dir",    d.dataDir)
+            InfoRow2("Data Dir", d.dataDir)
             InfoRow2("Native Libs", d.nativeLibDir)
-        }
-        InfoSection("Components") {
-            InfoRow2("Activities",  d.activities.size.toString())
-            InfoRow2("Services",    d.services.size.toString())
-            InfoRow2("Receivers",   d.receivers.size.toString())
-            InfoRow2("Permissions", d.permissions.size.toString())
         }
     }
 }
@@ -328,9 +439,9 @@ private fun PermissionsTab(perms: List<String>) {
             fontSize = 12.sp, modifier = Modifier.padding(bottom = 4.dp))
         perms.forEach { perm ->
             val isDangerous = perm.contains("READ_") || perm.contains("WRITE_") ||
-                perm.contains("LOCATION") || perm.contains("CAMERA") ||
-                perm.contains("CONTACTS") || perm.contains("PHONE") ||
-                perm.contains("SMS") || perm.contains("STORAGE")
+                    perm.contains("LOCATION") || perm.contains("CAMERA") ||
+                    perm.contains("CONTACTS") || perm.contains("PHONE") ||
+                    perm.contains("SMS") || perm.contains("STORAGE")
             val color = if (isDangerous) AzlukWarning else AzlukOnSurface
             Surface(
                 color = if (isDangerous) AzlukWarning.copy(.06f) else AzlukSurface,
@@ -444,4 +555,3 @@ private fun fmtSize(b: Long) = when {
     b < 1024L*1024*1024 -> "%.1f MB".format(b/(1024f*1024))
     else -> "%.2f GB".format(b/(1024f*1024*1024))
 }
-
