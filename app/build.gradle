@@ -3,7 +3,6 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
-// Load local.properties for secrets (NEVER committed to git)
 def localProps = new Properties()
 def localPropsFile = rootProject.file('local.properties')
 if (localPropsFile.exists()) {
@@ -18,19 +17,9 @@ android {
         applicationId "com.azluk.patcher"
         minSdk 26
         targetSdk 34
-        versionCode 9
-        versionName "9.0"
+        versionCode 10
+        versionName "10.0"
 
-        // ── TokenRouter config ────────────────────────────────────────────
-        //
-        // Resolution order (first NON-EMPTY wins):
-        //   1. Environment variable  — CI/GitHub Actions secrets
-        //   2. local.properties      — local dev only (gitignored)
-        //   3. Built-in default
-        //
-        // NOTE: an empty-string default from getProperty() short-circuits
-        // the Elvis operator, so env vars must be probed EXPLICITLY or
-        // Actions secrets would silently never reach BuildConfig.
         def trKey = [
                 System.getenv('TOKENROUTER_API_KEY'),
                 localProps.getProperty('TOKENROUTER_API_KEY')
@@ -65,7 +54,7 @@ android {
 
     buildFeatures {
         compose true
-        buildConfig true // needed for BuildConfig.TOKENROUTER_*
+        buildConfig true
     }
 
     composeOptions {
