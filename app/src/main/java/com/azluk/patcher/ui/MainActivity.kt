@@ -63,8 +63,11 @@ class MainActivity : ComponentActivity() {
     private fun requestPerm() {
         if (hasPermission()) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            runCatching { startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName"))) }
-                .onFailure { runCatching { startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) } }
+            runCatching {
+                startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+            }.onFailure {
+                runCatching { startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) }
+            }
         } else {
             permLauncher.launch(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE))
         }
@@ -84,6 +87,14 @@ private fun AzlukApp(sysVm: SystemCheckViewModel) {
             composable("home")    { HomeScreen(nav) }
             composable("patched") { PatchedFilesScreen(nav) }
             composable("tools")   { ToolsScreen(nav) }
+            composable("packs")   { PatchPacksScreen(nav) }
+            composable(
+                "detail/{pkg}",
+                arguments = listOf(navArgument("pkg") { type = NavType.StringType })
+            ) { back ->
+                val pkg = back.arguments?.getString("pkg") ?: return@composable
+                DetailScreen(pkg = pkg, navController = nav)
+            }
             composable(
                 "patch/{pkg}",
                 arguments = listOf(navArgument("pkg") { type = NavType.StringType })
@@ -91,7 +102,6 @@ private fun AzlukApp(sysVm: SystemCheckViewModel) {
                 val pkg = back.arguments?.getString("pkg") ?: return@composable
                 PatchScreen(pkg = pkg, navController = nav)
             }
-            // Separate log + install screen — navigated to after choosing patch options
             composable(
                 "patchlog/{pkg}",
                 arguments = listOf(navArgument("pkg") { type = NavType.StringType })
@@ -118,7 +128,6 @@ private fun PermissionScreen(onRequest: () -> Unit) {
     }
 }
 
-// ── InstallReceiver — all 3 bugs fixed ───────────────────────────────────────
 class InstallReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
         val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, -999)
