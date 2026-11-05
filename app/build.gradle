@@ -17,8 +17,8 @@ android {
         applicationId "com.azluk.patcher"
         minSdk 26
         targetSdk 34
-        versionCode 10
-        versionName "10.0"
+        versionCode 9
+        versionName "9.1(202611)"
 
         def trKey = [
                 System.getenv('TOKENROUTER_API_KEY'),
